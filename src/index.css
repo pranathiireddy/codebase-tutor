@@ -1,0 +1,107 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+
+  html, body {
+    font-family: var(--font-sans);
+    background-color: #0B0D10;
+    color: #E6E9EF;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+  }
+}
+
+/* Subtle developer-tool scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #232832;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #323947;
+}
+
+/* Monaco highlight decorations for evidence-grounded navigation */
+.ct-highlight-line {
+  background-color: rgba(56, 189, 248, 0.14) !important;
+  box-shadow: inset 2px 0 0 #38BDF8;
+}
+
+.ct-highlight-glyph {
+  background-color: #38BDF8;
+  width: 3px !important;
+  margin-left: 3px;
+}
+
+/* React Flow dark canvas integration */
+.react-flow__controls {
+  background: #111419 !important;
+  border: 1px solid #232832 !important;
+  border-radius: 8px !important;
+  box-shadow: none !important;
+  overflow: hidden;
+}
+
+.react-flow__controls-button {
+  background: #111419 !important;
+  border-bottom: 1px solid #232832 !important;
+  color: #9CA3AF !important;
+  fill: #9CA3AF !important;
+}
+
+.react-flow__controls-button:hover {
+  background: #1A1F28 !important;
+  color: #E6E9EF !important;
+}
+
+.react-flow__minimap {
+  background: #0F1217 !important;
+  border: 1px solid #232832 !important;
+  border-radius: 8px !important;
+}
+
+.react-flow__attribution {
+  display: none !important;
+}
+
+/* Edge labels and background boxes visible only on selection/click */
+.react-flow__edge .react-flow__edge-text-wrapper,
+.react-flow__edge .react-flow__edge-text,
+.react-flow__edge .react-flow__edge-text-bg {
+  opacity: 0;
+  transition: opacity 0.18s ease-in-out;
+  pointer-events: none;
+}
+
+.react-flow__edge.selected .react-flow__edge-text-wrapper,
+.react-flow__edge.selected .react-flow__edge-text,
+.react-flow__edge.selected .react-flow__edge-text-bg,
+.react-flow__edge[aria-selected="true"] .react-flow__edge-text-wrapper,
+.react-flow__edge[aria-selected="true"] .react-flow__edge-text,
+.react-flow__edge[aria-selected="true"] .react-flow__edge-text-bg {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.react-flow__edge {
+  cursor: pointer;
+}
