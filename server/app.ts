@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import cookieParser from 'cookie-parser';
+import { z } from 'zod';
 import {
   clearRepositoryCache,
   getAnalyzedRepo,
@@ -22,14 +23,31 @@ import {
   createSession,
   changePasswordAndRotateSession,
   clearFailedLogins,
+  clearChats,
+  completeTourStep,
+  createChat,
+  deleteChat,
+  getAllChatMessages,
+  getChat,
+  getChatMessages,
+  getChatPromptHistory,
+  getUserPreferences,
   findUserByEmail,
   findUserById,
   insertUser,
+  listChatsForRepository,
+  listExploredItems,
+  listTourProgress,
   listActiveSessions,
+  markExploredItem,
   recordAuditEvent,
   recordFailedLogin,
+  renameChat,
   revokeAllSessions,
   revokeSession,
+  saveChatMessage,
+  saveUserPreferences,
+  type ChatMessageRecord,
 } from './db/index.ts';
 import {
   clearSessionCookie,
@@ -51,7 +69,64 @@ import {
   verifyDummyPassword,
   verifyPassword,
 } from './auth.ts';
-import type { ChatContext, DiagramType, UserProfile } from '../src/types/codebase.ts';
+import type { ChatCitation, ChatContext, DiagramType, UserProfile } from '../src/types/codebase.ts';
+
+const DIAGRAM_TYPES = [
+  'system_architecture',
+  'data_flow',
+  'sequence',
+  'cicd_pipeline',
+  'deployment',
+  'class_diagram',
+] as const;
+
+const chatContextSchema = z
+  .object({
+    selectedFilePath: z.string().max(512).optional(),
+    selectedSymbolId: z.string().max(256).optional(),
+    selectedSymbolName: z.string().max(256).optional(),
+    selectedCodeRange: z
+      .object({
+        start_line: z.number().int().positive(),
+        end_line: z.number().int().positive(),
+      })
+      .optional(),
+    selectedDiagramType: z.enum(DIAGRAM_TYPES).optional(),
+    selectedNodeId: z.string().max(256).optional(),
+    selectedNodeName: z.string().max(256).optional(),
+    selectedEdgeId: z.string().max(256).optional(),
+    attachedCode: z
+      .object({
+        file_path: z.string().max(512),
+        start_line: z.number().int().positive(),
+        end_line: z.number().int().positive(),
+        code: z.string().max(400_000),
+        symbol_name: z.string().max(256).optional(),
+      })
+      .optional(),
+  })
+  .strict();
+
+const userPreferencesSchema = z.object({
+  editorFontSize: z.union([z.literal(12), z.literal(13), z.literal(14), z.literal(15)]),
+  defaultDiagramType: z.enum(DIAGRAM_TYPES),
+  showMinimap: z.boolean(),
+  chatRetentionDays: z.number().int().min(0).max(3650),
+});
+
+function serializeChatMessage(message: ChatMessageRecord) {
+  return {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    contextLabel: message.contextLabel ?? undefined,
+    citations: message.citationsJson ? (JSON.parse(message.citationsJson) as ChatCitation[]) : undefined,
+    confidenceSummary: message.confidenceJson
+      ? (JSON.parse(message.confidenceJson) as 'verified' | 'partial' | 'unknown')
+      : undefined,
+    timestamp: new Date(message.createdAt).toISOString(),
+  };
+}
 
 export function createApp(): express.Express {
   const app = express();
@@ -634,21 +709,257 @@ app.get('/api/repositories/:id/diagrams/:type/nodes/:nodeId', optionalAuth, (req
   });
 });
 
-app.post('/api/repositories/:id/chat', requireAuth, async (req: Request, res: Response) => {
+app.get('/api/preferences', requireAuth, (_req: Request, res: Response) => {
   const user = getRequestUser(res)!;
-  const id = String(req.params.id);
-  const { question, context, history } = req.body as {
-    question?: string;
-    context?: ChatContext;
-    history?: { role: 'user' | 'assistant'; content: string }[];
-  };
+  const preferences = getUserPreferences(user.id);
+  res.json({ preferences });
+});
 
-  if (!question || typeof question !== 'string' || !question.trim()) {
-    res.status(400).json({ error: 'Question cannot be empty.' });
+app.put('/api/preferences', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const parsed = userPreferencesSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Preferences contain an invalid value.' });
     return;
   }
+  const preferences = saveUserPreferences(user.id, parsed.data, Date.now());
+  res.json({ preferences });
+});
 
-  const data = getAnalyzedRepo(id, user.id);
+app.get('/api/repositories/:id/progress', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const repositoryId = String(req.params.id);
+  const repository = getRepositoryRecord(repositoryId, user.id);
+  if (!repository) {
+    res.status(404).json({ error: 'Repository not found.' });
+    return;
+  }
+  const exploredItems = listExploredItems(user.id, repositoryId);
+  const tourProgress = listTourProgress(user.id, repositoryId);
+  const analysis = getAnalyzedRepo(repositoryId, user.id);
+  const totalTourSteps = repository.overview?.walkthrough.length ?? 0;
+  res.json({
+    exploredItems,
+    tourProgress,
+    exploredCount: exploredItems.length,
+    totalFiles: analysis?.analysis.filesMeta.length ?? 0,
+    completedTourCount: tourProgress.filter((step) => step.tourId === 'overview').length,
+    totalTourSteps,
+  });
+});
+
+app.post('/api/repositories/:id/progress/explored', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const repositoryId = String(req.params.id);
+  const data = getAnalyzedRepo(repositoryId, user.id);
+  const nodeId = typeof req.body?.nodeId === 'string' ? req.body.nodeId : '';
+  if (!data || !nodeId.startsWith('file:') || nodeId.length > 520) {
+    res.status(400).json({ error: 'Invalid explored file.' });
+    return;
+  }
+  const filePath = nodeId.slice('file:'.length);
+  if (!data.analysis.filesMeta.some((file) => file.path === filePath)) {
+    res.status(404).json({ error: 'File not found in this repository.' });
+    return;
+  }
+  markExploredItem(user.id, repositoryId, nodeId, Date.now());
+  res.json({ ok: true });
+});
+
+app.post('/api/repositories/:id/progress/tours', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const repositoryId = String(req.params.id);
+  const repository = getRepositoryRecord(repositoryId, user.id);
+  const { tourId, stepIndex } = req.body ?? {};
+  const steps = repository?.overview?.walkthrough ?? [];
+  if (
+    !repository ||
+    tourId !== 'overview' ||
+    !Number.isInteger(stepIndex) ||
+    stepIndex < 0 ||
+    stepIndex >= steps.length
+  ) {
+    res.status(400).json({ error: 'Invalid walkthrough step.' });
+    return;
+  }
+  completeTourStep(user.id, repositoryId, tourId, stepIndex, Date.now());
+  res.json({ ok: true });
+});
+
+app.post('/api/chats', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const repositoryId = typeof req.body?.repositoryId === 'string' ? req.body.repositoryId.trim() : '';
+  const title = typeof req.body?.title === 'string' ? req.body.title.trim() : 'New chat';
+  if (!repositoryId || repositoryId.length > 200 || !title || title.length > 100) {
+    res.status(400).json({ error: 'Enter a valid repository and chat title.' });
+    return;
+  }
+  if (!getRepositoryRecord(repositoryId, user.id)) {
+    res.status(404).json({ error: 'Repository not found.' });
+    return;
+  }
+  const chat = createChat({
+    id: crypto.randomUUID(),
+    userId: user.id,
+    repositoryId,
+    title,
+    now: Date.now(),
+  });
+  res.status(201).json({ chat });
+});
+
+app.get('/api/repositories/:id/chats', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const repositoryId = String(req.params.id);
+  if (!getRepositoryRecord(repositoryId, user.id)) {
+    res.status(404).json({ error: 'Repository not found.' });
+    return;
+  }
+  res.json({ chats: listChatsForRepository(user.id, repositoryId) });
+});
+
+app.get('/api/chats/:chatId/messages', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const chatId = String(req.params.chatId);
+  if (!getChat(user.id, chatId)) {
+    res.status(404).json({ error: 'Chat not found.' });
+    return;
+  }
+  const limit = Number(req.query.limit ?? 50);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+    res.status(400).json({ error: 'Message page size must be between 1 and 50.' });
+    return;
+  }
+  let before: { createdAt: number; id: string } | undefined;
+  const beforeCreatedAt = req.query.beforeCreatedAt;
+  const beforeId = req.query.beforeId;
+  if (beforeCreatedAt !== undefined || beforeId !== undefined) {
+    const createdAt = Number(beforeCreatedAt);
+    if (
+      !Number.isSafeInteger(createdAt) ||
+      typeof beforeId !== 'string' ||
+      beforeId.length < 1 ||
+      beforeId.length > 100
+    ) {
+      res.status(400).json({ error: 'Invalid older-message cursor.' });
+      return;
+    }
+    before = { createdAt, id: beforeId };
+  }
+  const page = getChatMessages(user.id, chatId, limit, before);
+  res.json({
+    messages: page.messages.map(serializeChatMessage),
+    hasMore: page.hasMore,
+    nextCursor: page.nextCursor,
+  });
+});
+
+app.patch('/api/chats/:chatId', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const chatId = String(req.params.chatId);
+  const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+  if (!title || title.length > 100) {
+    res.status(400).json({ error: 'Chat title must be between 1 and 100 characters.' });
+    return;
+  }
+  if (!renameChat(user.id, chatId, title, Date.now())) {
+    res.status(404).json({ error: 'Chat not found.' });
+    return;
+  }
+  res.json({ chat: getChat(user.id, chatId) });
+});
+
+app.delete('/api/chats/:chatId', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  if (!deleteChat(user.id, String(req.params.chatId))) {
+    res.status(404).json({ error: 'Chat not found.' });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+app.delete('/api/chats', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  res.json({ deleted: clearChats(user.id) });
+});
+
+app.delete('/api/repositories/:id/chats', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const repositoryId = String(req.params.id);
+  if (!getRepositoryRecord(repositoryId, user.id)) {
+    res.status(404).json({ error: 'Repository not found.' });
+    return;
+  }
+  res.json({ deleted: clearChats(user.id, repositoryId) });
+});
+
+app.get('/api/chats/:chatId/export', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const chatId = String(req.params.chatId);
+  const chat = getChat(user.id, chatId);
+  if (!chat) {
+    res.status(404).json({ error: 'Chat not found.' });
+    return;
+  }
+  const messages = getAllChatMessages(user.id, chatId);
+  if (!messages) {
+    res.status(404).json({ error: 'Chat not found.' });
+    return;
+  }
+  const format = req.query.format ?? 'json';
+  if (format !== 'json' && format !== 'markdown') {
+    res.status(400).json({ error: 'Export format must be json or markdown.' });
+    return;
+  }
+  const safeTitle = chat.title.replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '') || 'chat';
+  const serializedMessages = messages.map(serializeChatMessage);
+  const content =
+    format === 'json'
+      ? JSON.stringify({ chat, messages: serializedMessages }, null, 2)
+      : [
+          `# ${chat.title}`,
+          '',
+          `Repository: ${chat.repositoryId}`,
+          '',
+          ...serializedMessages.flatMap((message) => [
+            `## ${message.role === 'user' ? 'You' : 'Codebase Tutor'}`,
+            '',
+            message.contextLabel ? `Context: ${message.contextLabel}` : '',
+            message.content,
+            ...(message.citations?.length
+              ? ['', ...message.citations.map((citation) => `- ${citation.file_path}:${citation.start_line}-${citation.end_line}`)]
+              : []),
+            '',
+          ]),
+        ].join('\n');
+  res.json({
+    fileName: `${safeTitle}.${format === 'json' ? 'json' : 'md'}`,
+    contentType: format === 'json' ? 'application/json' : 'text/markdown',
+    content,
+  });
+});
+
+app.post('/api/chats/:chatId/messages', requireAuth, async (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const chatId = String(req.params.chatId);
+  const chat = getChat(user.id, chatId);
+  if (!chat) {
+    res.status(404).json({ error: 'Chat not found.' });
+    return;
+  }
+  const body = req.body as Record<string, unknown> | null;
+  if (body && 'history' in body) {
+    res.status(400).json({ error: 'Chat history is loaded by the server and must not be sent by the client.' });
+    return;
+  }
+  const question = typeof body?.question === 'string' ? body.question.trim() : '';
+  const contextLabel = typeof body?.contextLabel === 'string' ? body.contextLabel.trim() : '';
+  const parsedContext = chatContextSchema.safeParse(body?.context ?? {});
+  if (!question || question.length > 20000 || contextLabel.length > 500 || !parsedContext.success) {
+    res.status(400).json({ error: 'Enter a valid question and chat context.' });
+    return;
+  }
+  const data = getAnalyzedRepo(chat.repositoryId, user.id);
   if (!data) {
     res.status(404).json({ error: 'Repository is not analyzed yet. Wait for analysis to finish before asking questions.' });
     return;
@@ -661,15 +972,53 @@ app.post('/api/repositories/:id/chat', requireAuth, async (req: Request, res: Re
     return;
   }
 
+  const history = getChatPromptHistory(
+    user.id,
+    chatId,
+    config.chatHistoryMaxMessages,
+    config.chatHistoryMaxChars
+  );
+  const now = Date.now();
+  const userMessage = saveChatMessage(user.id, chatId, {
+    id: crypto.randomUUID(),
+    role: 'user',
+    content: question,
+    contextLabel: contextLabel || undefined,
+    createdAt: now,
+  });
+  if (!userMessage) {
+    res.status(404).json({ error: 'Chat not found.' });
+    return;
+  }
+
   try {
     const result = await generateGroundedExplanation(
       data,
-      question.trim(),
-      context ?? {},
-      Array.isArray(history) ? history : [],
+      question,
+      parsedContext.data as ChatContext,
+      history,
       { apiKeyOverride, modelOverride }
     );
-    res.json(result);
+    const assistantMessage = saveChatMessage(user.id, chatId, {
+      id: crypto.randomUUID(),
+      role: 'assistant',
+      content: result.answer,
+      citations: result.citations,
+      confidence: result.confidenceSummary,
+      createdAt: Date.now(),
+    });
+    if (!assistantMessage) {
+      res.status(409).json({ error: 'Chat was deleted before the answer could be saved.' });
+      return;
+    }
+    res.json({
+      answer: result.answer,
+      citations: result.citations,
+      confidenceSummary: result.confidenceSummary,
+      modelUsed: result.modelUsed,
+      userMessage: serializeChatMessage(userMessage),
+      assistantMessage: serializeChatMessage(assistantMessage),
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to generate explanation.';
     const status = message.includes('GEMINI_API_KEY') ? 503 : 500;

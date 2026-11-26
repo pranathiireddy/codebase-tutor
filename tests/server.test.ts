@@ -17,7 +17,7 @@ beforeAll(async () => {
   process.env.NODE_ENV = 'test';
   process.env.DATABASE_PATH = databasePath;
   process.env.ALLOW_SERVER_KEY = 'false';
-  process.env.ALLOWED_ORIGINS = 'http://localhost:3000,http://localhost:5173';
+  process.env.ALLOWED_ORIGINS = 'http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173';
   const [appModule, databaseModule, authModule] = await Promise.all([
     import('../server/app.ts'),
     import('../server/db/index.ts'),
@@ -97,6 +97,27 @@ describe('GET /api/health', () => {
 
     expect(response.status).toBe(403);
     expect(response.body.error).toBe('Origin is not allowed.');
+  });
+
+  it('allows signup from the configured 127.0.0.1 development origin', async () => {
+    const loopbackOrigin = 'http://127.0.0.1:5173';
+    const agent = request.agent(app);
+    const csrf = await agent.get('/api/auth/csrf').set('Origin', loopbackOrigin);
+    expect(csrf.status).toBe(200);
+
+    const response = await agent
+      .post('/api/auth/signup')
+      .set('Origin', loopbackOrigin)
+      .set('X-CSRF-Token', csrf.body.csrfToken as string)
+      .send({
+        name: 'Loopback Student',
+        email: 'loopback-origin@example.com',
+        password: 'Loopback-Account-Password-27!',
+        role: 'Student',
+      });
+
+    expect(response.status).toBe(201);
+    expect(response.body.user.email).toBe('loopback-origin@example.com');
   });
 });
 
@@ -248,5 +269,149 @@ describe('persistent owner and Gemini quota records', () => {
     expect(database.consumeGeminiDailyQuota(firstUser.id, '2026-01-01', 2)).toBe(true);
     expect(database.consumeGeminiDailyQuota(firstUser.id, '2026-01-01', 2)).toBe(true);
     expect(database.consumeGeminiDailyQuota(firstUser.id, '2026-01-01', 2)).toBe(false);
+  });
+});
+
+describe('persistent chats and learning progress', () => {
+  it('persists messages across a database reopen and scopes them to the chat owner', async () => {
+    const user = await insertTestUser('chat-persistence@example.com');
+    const otherUser = await insertTestUser('chat-other-owner@example.com');
+    const chatId = crypto.randomUUID();
+    const now = Date.now();
+    database.createChat({ id: chatId, userId: user.id, repositoryId: 'owner__repo', title: 'New chat', now });
+    database.saveChatMessage(user.id, chatId, {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: 'Explain this file.',
+      contextLabel: 'src/index.ts',
+      createdAt: now + 1,
+    });
+    database.saveChatMessage(user.id, chatId, {
+      id: crypto.randomUUID(),
+      role: 'assistant',
+      content: 'This is the entry point.',
+      citations: [{ file_path: 'src/index.ts', start_line: 1, end_line: 8, label: 'Entry point' }],
+      confidence: 'verified',
+      createdAt: now + 2,
+    });
+
+    expect(database.getChatMessages(user.id, chatId, 50).messages).toHaveLength(2);
+    expect(database.getChat(otherUser.id, chatId)).toBeUndefined();
+    expect(database.getChatMessages(otherUser.id, chatId, 50).messages).toHaveLength(0);
+
+    database.closeDatabase();
+    database.initializeDatabase();
+
+    const restored = database.getChatMessages(user.id, chatId, 50).messages;
+    expect(restored.map((message) => message.content)).toEqual([
+      'Explain this file.',
+      'This is the entry point.',
+    ]);
+  });
+
+  it('exports a chat and deletes its messages with the chat', async () => {
+    const user = await insertTestUser('chat-export@example.com');
+    const agent = request.agent(app);
+    const login = await postWithCsrf(agent, '/api/auth/login', {
+      email: user.email,
+      password: user.password,
+    });
+    expect(login.status).toBe(200);
+
+    const chatId = crypto.randomUUID();
+    const now = Date.now();
+    database.createChat({ id: chatId, userId: user.id, repositoryId: 'owner__repo', title: 'Export test', now });
+    database.saveChatMessage(user.id, chatId, {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: 'Show the entry point.',
+      contextLabel: 'src/index.ts',
+      createdAt: now + 1,
+    });
+    database.saveChatMessage(user.id, chatId, {
+      id: crypto.randomUUID(),
+      role: 'assistant',
+      content: 'The entry point is here.',
+      citations: [{ file_path: 'src/index.ts', start_line: 1, end_line: 8, label: 'Entry point' }],
+      createdAt: now + 2,
+    });
+
+    const exported = await agent.get(`/api/chats/${chatId}/export?format=markdown`);
+    expect(exported.status).toBe(200);
+    expect(exported.body.fileName).toBe('Export-test.md');
+    expect(exported.body.content).toContain('The entry point is here.');
+
+    const token = await csrfToken(agent);
+    const deleted = await agent
+      .delete(`/api/chats/${chatId}`)
+      .set('Origin', origin)
+      .set('X-CSRF-Token', token);
+    expect(deleted.status).toBe(200);
+    expect(database.getChat(user.id, chatId)).toBeUndefined();
+    expect(database.getAllChatMessages(user.id, chatId)).toBeUndefined();
+  });
+
+  it('keeps server prompt history within message and character budgets', async () => {
+    const user = await insertTestUser('chat-budget@example.com');
+    const chatId = crypto.randomUUID();
+    const now = Date.now();
+    database.createChat({ id: chatId, userId: user.id, repositoryId: 'owner__repo', title: 'Budget test', now });
+    for (let index = 0; index < 6; index += 1) {
+      database.saveChatMessage(user.id, chatId, {
+        id: crypto.randomUUID(),
+        role: index % 2 === 0 ? 'user' : 'assistant',
+        content: `message-${index}`,
+        createdAt: now + index + 1,
+      });
+    }
+
+    const history = database.getChatPromptHistory(user.id, chatId, 4, 18);
+    expect(history.length).toBeLessThanOrEqual(4);
+    expect(history.reduce((total, message) => total + message.content.length, 0)).toBeLessThanOrEqual(18);
+    expect(history[history.length - 1].content).toBe('message-5');
+  });
+
+  it('stores explored files and tour steps separately per user', async () => {
+    const user = await insertTestUser('progress-owner@example.com');
+    const otherUser = await insertTestUser('progress-other@example.com');
+    database.markExploredItem(user.id, 'owner__repo', 'file:src/index.ts', Date.now());
+    database.completeTourStep(user.id, 'owner__repo', 'overview', 2, Date.now());
+
+    expect(database.listExploredItems(user.id, 'owner__repo')).toEqual(['file:src/index.ts']);
+    expect(database.listTourProgress(user.id, 'owner__repo').map((step) => step.stepIndex)).toEqual([2]);
+    expect(database.listExploredItems(otherUser.id, 'owner__repo')).toEqual([]);
+    expect(database.listTourProgress(otherUser.id, 'owner__repo')).toEqual([]);
+  });
+
+  it('deletes chats only when their owner has an enabled retention period', async () => {
+    const user = await insertTestUser('chat-retention@example.com');
+    const keepUser = await insertTestUser('chat-retention-keep@example.com');
+    const now = Date.now();
+    database.saveUserPreferences(user.id, {
+      editorFontSize: 13,
+      defaultDiagramType: 'system_architecture',
+      showMinimap: true,
+      chatRetentionDays: 1,
+    }, now);
+    const expiredId = crypto.randomUUID();
+    const retainedId = crypto.randomUUID();
+    database.createChat({
+      id: expiredId,
+      userId: user.id,
+      repositoryId: 'owner__repo',
+      title: 'Expired',
+      now: now - 2 * 24 * 60 * 60 * 1000,
+    });
+    database.createChat({
+      id: retainedId,
+      userId: keepUser.id,
+      repositoryId: 'owner__repo',
+      title: 'Keep forever',
+      now: now - 2 * 24 * 60 * 60 * 1000,
+    });
+
+    expect(database.deleteExpiredChats(now)).toBe(1);
+    expect(database.getChat(user.id, expiredId)).toBeUndefined();
+    expect(database.getChat(keepUser.id, retainedId)).toBeDefined();
   });
 });

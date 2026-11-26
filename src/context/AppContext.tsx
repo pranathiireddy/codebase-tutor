@@ -6,6 +6,7 @@ export interface WorkspacePreferences {
   editorFontSize: number;
   defaultDiagramType: DiagramType;
   showMinimap: boolean;
+  chatRetentionDays: number;
 }
 
 export interface UserApiCredentials {
@@ -29,6 +30,7 @@ interface AppContextValue {
   logout: () => Promise<void>;
   preferences: WorkspacePreferences;
   updatePreferences: (partial: Partial<WorkspacePreferences>) => void;
+  preferencesError: string | null;
   credentials: UserApiCredentials;
   updateCredentials: (partial: Partial<UserApiCredentials>) => void;
   clearCredentials: () => void;
@@ -37,6 +39,13 @@ interface AppContextValue {
 }
 
 const SESSION_CREDS_KEY = 'codebase_tutor_session_creds_v1';
+
+const DEFAULT_PREFERENCES: WorkspacePreferences = {
+  editorFontSize: 13,
+  defaultDiagramType: 'system_architecture',
+  showMinimap: true,
+  chatRetentionDays: 0,
+};
 
 const DEFAULT_CREDENTIALS: UserApiCredentials = {
   geminiApiKey: '',
@@ -83,11 +92,9 @@ const AppContext = createContext<AppContextValue | undefined>(undefined);
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<UserProfile | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [preferences, setPreferences] = useState<WorkspacePreferences>({
-    editorFontSize: 13,
-    defaultDiagramType: 'system_architecture',
-    showMinimap: true,
-  });
+  const [preferences, setPreferences] = useState<WorkspacePreferences>(DEFAULT_PREFERENCES);
+  const [preferencesOwner, setPreferencesOwner] = useState<string | null>(null);
+  const [preferencesError, setPreferencesError] = useState<string | null>(null);
   const [credentials, setCredentials] = useState<UserApiCredentials>(loadInitialCredentials);
   const [credentialStatus, setCredentialStatus] = useState<CredentialStatus>({
     geminiVerified: null,
@@ -123,6 +130,58 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setPreferencesOwner(null);
+    if (!user) {
+      setPreferences(DEFAULT_PREFERENCES);
+      setPreferencesError(null);
+      return;
+    }
+
+    void apiFetch('/api/preferences')
+      .then(async (res) => {
+        const payload = await safeJson<{ preferences?: WorkspacePreferences; error?: string }>(res);
+        if (!res.ok || !payload.preferences) {
+          throw new Error(payload.error || 'Unable to load your preferences.');
+        }
+        if (!cancelled) {
+          setPreferences(payload.preferences);
+          setPreferencesOwner(user.id);
+          setPreferencesError(null);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setPreferencesError(error instanceof Error ? error.message : 'Unable to load your preferences.');
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  useEffect(() => {
+    if (!user || preferencesOwner !== user.id) return;
+    const timer = setTimeout(() => {
+      void apiFetch('/api/preferences', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(preferences),
+      })
+        .then(async (res) => {
+          const payload = await safeJson<{ error?: string }>(res);
+          if (!res.ok) throw new Error(payload.error || 'Unable to save your preferences.');
+          setPreferencesError(null);
+        })
+        .catch((error: unknown) => {
+          setPreferencesError(error instanceof Error ? error.message : 'Unable to save your preferences.');
+        });
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [preferences, preferencesOwner, user]);
 
   const setSession = useCallback((nextUser: UserProfile | null) => {
     setUser(nextUser);
@@ -171,6 +230,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         logout,
         preferences,
         updatePreferences,
+        preferencesError,
         credentials,
         updateCredentials,
         clearCredentials,

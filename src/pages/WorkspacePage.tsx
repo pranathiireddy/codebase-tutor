@@ -26,7 +26,10 @@ import type {
   AnalyzedFileMeta,
   ChatCitation,
   ChatContext,
+  ChatMessageCursor,
   ChatMessage,
+  ChatProgress,
+  ChatRecord,
   CodeAttachment,
   DiagramType,
   DiagramVisualEdge,
@@ -83,6 +86,17 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
   const [attachedCode, setAttachedCode] = useState<CodeAttachment | undefined>(undefined);
+  const [chats, setChats] = useState<ChatRecord[]>([]);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [loadingChats, setLoadingChats] = useState(false);
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [nextMessageCursor, setNextMessageCursor] = useState<ChatMessageCursor | undefined>();
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [exploredItemIds, setExploredItemIds] = useState<Set<string>>(new Set());
+  const [completedTourSteps, setCompletedTourSteps] = useState<Set<number>>(new Set());
+  const [progressError, setProgressError] = useState<string | null>(null);
+  const activeChatIdRef = useRef<string | null>(null);
 
   // Quick import modal
   const [showImportModal, setShowImportModal] = useState(false);
@@ -155,6 +169,7 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     // Reset selection when switching repo
+    setRepository(null);
     setSelectedFilePath(null);
     setFileData(null);
     setHighlightRange(null);
@@ -164,6 +179,15 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
     fileContentCacheRef.current.clear();
     setMessages([]);
     setAttachedCode(undefined);
+    setChats([]);
+    setActiveChatId(null);
+    activeChatIdRef.current = null;
+    setHasMoreMessages(false);
+    setNextMessageCursor(undefined);
+    setChatError(null);
+    setExploredItemIds(new Set());
+    setCompletedTourSteps(new Set());
+    setProgressError(null);
 
     async function loadAnalysis() {
       try {
@@ -227,6 +251,267 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
       if (timer) clearTimeout(timer);
     };
   }, [targetRepoId, loadRepoList, apiFetch]);
+
+  const loadChatMessages = useCallback(
+    async (chatId: string, cursor?: ChatMessageCursor, prepend = false) => {
+      const params = new URLSearchParams({ limit: '50' });
+      if (cursor) {
+        params.set('beforeCreatedAt', String(cursor.createdAt));
+        params.set('beforeId', cursor.id);
+      }
+      const res = await apiRequest(`/api/chats/${encodeURIComponent(chatId)}/messages?${params}`);
+      const payload = await safeJson<{
+        messages: ChatMessage[];
+        hasMore: boolean;
+        nextCursor?: ChatMessageCursor;
+        error?: string;
+      }>(res);
+      if (!res.ok) throw new Error(payload.error || 'Unable to load chat messages.');
+      if (activeChatIdRef.current === chatId) {
+        setMessages((current) => (prepend ? [...payload.messages, ...current] : payload.messages));
+        setHasMoreMessages(payload.hasMore);
+        setNextMessageCursor(payload.nextCursor);
+        setChatError(null);
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (readOnly || repository?.id !== targetRepoId || repository.stage !== 'ready') return;
+    let cancelled = false;
+    setLoadingChats(true);
+    async function loadWorkspaceHistory() {
+      try {
+        const [chatsResult, progressResult] = await Promise.allSettled([
+          apiRequest(`/api/repositories/${encodeURIComponent(targetRepoId)}/chats`),
+          apiRequest(`/api/repositories/${encodeURIComponent(targetRepoId)}/progress`),
+        ]);
+        if (chatsResult.status === 'rejected') throw chatsResult.reason;
+        const chatsRes = chatsResult.value;
+        const chatsPayload = await safeJson<{ chats?: ChatRecord[]; error?: string }>(chatsRes);
+        if (!chatsRes.ok || !chatsPayload.chats) {
+          throw new Error(chatsPayload.error || 'Unable to load repository chats.');
+        }
+        if (cancelled) return;
+        setChats(chatsPayload.chats);
+        if (progressResult.status === 'rejected') {
+          setProgressError(
+            progressResult.reason instanceof Error
+              ? progressResult.reason.message
+              : 'Unable to load learning progress.'
+          );
+        } else {
+          try {
+            const progressPayload = await safeJson<ChatProgress & { error?: string }>(progressResult.value);
+            if (!progressResult.value.ok) {
+              throw new Error(progressPayload.error || 'Unable to load learning progress.');
+            }
+            setExploredItemIds(new Set(progressPayload.exploredItems));
+            setCompletedTourSteps(
+              new Set(progressPayload.tourProgress.filter((item) => item.tourId === 'overview').map((item) => item.stepIndex))
+            );
+            setProgressError(null);
+          } catch (error) {
+            setProgressError(error instanceof Error ? error.message : 'Unable to load learning progress.');
+          }
+        }
+        const activeChat = chatsPayload.chats[0];
+        setActiveChatId(activeChat?.id ?? null);
+        activeChatIdRef.current = activeChat?.id ?? null;
+        if (activeChat) await loadChatMessages(activeChat.id);
+        else setMessages([]);
+      } catch (error) {
+        if (!cancelled) {
+          setChatError(error instanceof Error ? error.message : 'Unable to load saved workspace data.');
+        }
+      } finally {
+        if (!cancelled) setLoadingChats(false);
+      }
+    }
+    void loadWorkspaceHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, [readOnly, repository?.id, repository?.stage, targetRepoId, loadChatMessages]);
+
+  const loadOlderMessages = useCallback(async () => {
+    if (!activeChatId || !nextMessageCursor || loadingOlderMessages) return;
+    setLoadingOlderMessages(true);
+    try {
+      await loadChatMessages(activeChatId, nextMessageCursor, true);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Unable to load older messages.');
+    } finally {
+      setLoadingOlderMessages(false);
+    }
+  }, [activeChatId, nextMessageCursor, loadingOlderMessages, loadChatMessages]);
+
+  const markFileExplored = useCallback(
+    async (filePath: string) => {
+      const nodeId = `file:${filePath}`;
+      if (readOnly || exploredItemIds.has(nodeId)) return;
+      setExploredItemIds((current) => new Set(current).add(nodeId));
+      setProgressError(null);
+      try {
+        const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/progress/explored`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nodeId }),
+        });
+        const payload = await safeJson<{ error?: string }>(res);
+        if (!res.ok) throw new Error(payload.error || 'Unable to save file progress.');
+      } catch (error) {
+        setProgressError(error instanceof Error ? error.message : 'Unable to save file progress.');
+      }
+    },
+    [readOnly, exploredItemIds, targetRepoId, apiFetch]
+  );
+
+  const markTourStepComplete = useCallback(
+    async (stepIndex: number) => {
+      if (readOnly || completedTourSteps.has(stepIndex)) return;
+      setCompletedTourSteps((current) => new Set(current).add(stepIndex));
+      setProgressError(null);
+      try {
+        const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/progress/tours`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tourId: 'overview', stepIndex }),
+        });
+        const payload = await safeJson<{ error?: string }>(res);
+        if (!res.ok) throw new Error(payload.error || 'Unable to save walkthrough progress.');
+      } catch (error) {
+        setProgressError(error instanceof Error ? error.message : 'Unable to save walkthrough progress.');
+      }
+    },
+    [readOnly, completedTourSteps, targetRepoId, apiFetch]
+  );
+
+  useEffect(() => {
+    if (selectedFilePath && repository?.stage === 'ready') void markFileExplored(selectedFilePath);
+  }, [selectedFilePath, repository?.stage, markFileExplored]);
+
+  const createChat = useCallback(async (): Promise<ChatRecord | null> => {
+    setChatError(null);
+    try {
+      const res = await apiFetch('/api/chats', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repositoryId: targetRepoId, title: 'New chat' }),
+      });
+      const payload = await safeJson<{ chat?: ChatRecord; error?: string }>(res);
+      if (!res.ok || !payload.chat) throw new Error(payload.error || 'Unable to create chat.');
+      setChats((current) => [payload.chat!, ...current]);
+      setActiveChatId(payload.chat.id);
+      activeChatIdRef.current = payload.chat.id;
+      setMessages([]);
+      setHasMoreMessages(false);
+      setNextMessageCursor(undefined);
+      return payload.chat;
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Unable to create chat.');
+      return null;
+    }
+  }, [targetRepoId, apiFetch]);
+
+  const selectChat = useCallback(
+    async (chatId: string) => {
+      setActiveChatId(chatId);
+      activeChatIdRef.current = chatId;
+      setMessages([]);
+      setChatError(null);
+      try {
+        await loadChatMessages(chatId);
+      } catch (error) {
+        setChatError(error instanceof Error ? error.message : 'Unable to load chat.');
+      }
+    },
+    [loadChatMessages]
+  );
+
+  const renameChat = useCallback(
+    async (chatId: string, title: string) => {
+      try {
+        const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title }),
+        });
+        const payload = await safeJson<{ chat?: ChatRecord; error?: string }>(res);
+        if (!res.ok || !payload.chat) throw new Error(payload.error || 'Unable to rename chat.');
+        setChats((current) => current.map((chat) => (chat.id === chatId ? payload.chat! : chat)));
+        setChatError(null);
+      } catch (error) {
+        setChatError(error instanceof Error ? error.message : 'Unable to rename chat.');
+      }
+    },
+    [apiFetch]
+  );
+
+  const deleteChat = useCallback(
+    async (chatId: string) => {
+      try {
+        const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+        const payload = await safeJson<{ error?: string }>(res);
+        if (!res.ok) throw new Error(payload.error || 'Unable to delete chat.');
+        const remaining = chats.filter((chat) => chat.id !== chatId);
+        setChats(remaining);
+        if (activeChatIdRef.current === chatId) {
+          const nextChat = remaining[0];
+          setActiveChatId(nextChat?.id ?? null);
+          activeChatIdRef.current = nextChat?.id ?? null;
+          setMessages([]);
+          setHasMoreMessages(false);
+          setNextMessageCursor(undefined);
+          if (nextChat) await loadChatMessages(nextChat.id);
+        }
+        setChatError(null);
+      } catch (error) {
+        setChatError(error instanceof Error ? error.message : 'Unable to delete chat.');
+      }
+    },
+    [chats, loadChatMessages, apiFetch]
+  );
+
+  const clearChats = useCallback(async () => {
+    try {
+      const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/chats`, {
+        method: 'DELETE',
+      });
+      const payload = await safeJson<{ error?: string }>(res);
+      if (!res.ok) throw new Error(payload.error || 'Unable to clear repository chats.');
+      setChats([]);
+      setActiveChatId(null);
+      activeChatIdRef.current = null;
+      setMessages([]);
+      setHasMoreMessages(false);
+      setNextMessageCursor(undefined);
+      setChatError(null);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Unable to clear repository chats.');
+    }
+  }, [targetRepoId, apiFetch]);
+
+  const exportChat = useCallback(
+    async (chatId: string, format: 'json' | 'markdown') => {
+      try {
+        const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}/export?format=${format}`);
+        const payload = await safeJson<{ fileName: string; contentType: string; content: string; error?: string }>(res);
+        if (!res.ok) throw new Error(payload.error || 'Unable to export chat.');
+        const url = URL.createObjectURL(new Blob([payload.content], { type: payload.contentType }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = payload.fileName;
+        link.click();
+        URL.revokeObjectURL(url);
+        setChatError(null);
+      } catch (error) {
+        setChatError(error instanceof Error ? error.message : 'Unable to export chat.');
+      }
+    },
+    [apiFetch]
+  );
 
   // Fetch file content whenever selectedFilePath changes
   useEffect(() => {
@@ -661,20 +946,27 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
         contextLabel: contextLabels.join(' · ') || undefined,
       };
 
-      const nextHistory = [...messages, userMsg];
-      setMessages(nextHistory);
+      setMessages((current) => [...current, userMsg]);
       setChatLoading(true);
+      let chatId = activeChatIdRef.current;
 
       try {
+        if (!chatId) {
+          const createdChat = await createChat();
+          if (!createdChat) throw new Error('Unable to create a chat for this question.');
+          chatId = createdChat.id;
+        }
         let json: {
           answer?: string;
           citations?: ChatMessage['citations'];
           confidenceSummary?: ChatMessage['confidenceSummary'];
           modelUsed?: string;
+          userMessage?: ChatMessage;
+          assistantMessage?: ChatMessage;
           error?: string;
         };
 
-        const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/chat`, {
+        const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}/messages`, {
           method: 'POST',
           headers: buildApiHeaders(
             credsToUse,
@@ -682,16 +974,18 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
           ),
           body: JSON.stringify({
             question,
+            contextLabel: contextLabels.join(' · '),
             context: ctxToUse,
-            history: messages
-              .filter((m) => !m.error && m.content.trim().length > 0)
-              .map((m) => ({ role: m.role, content: m.content })),
           }),
         });
         json = await safeJson<typeof json>(res);
 
         if (!res.ok) {
           throw new Error(json.error || 'Unable to generate explanation.');
+        }
+
+        if (!json.userMessage || !json.assistantMessage) {
+          throw new Error('The server returned an incomplete chat response.');
         }
 
         if (
@@ -702,18 +996,23 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
           updateCredentials({ geminiModel: json.modelUsed });
         }
 
-        const assistantMsg: ChatMessage = {
-          id: `a_${Date.now()}`,
-          role: 'assistant',
-          content: json.answer || 'No explanation generated.',
-          timestamp: new Date().toISOString(),
-          citations: json.citations,
-          confidenceSummary: json.confidenceSummary,
-        };
-        setMessages((prev) => [...prev, assistantMsg]);
+        if (activeChatIdRef.current === chatId) {
+          setMessages((current) => [
+            ...current.filter((message) => message.id !== userMsg.id),
+            json.userMessage!,
+            json.assistantMessage!,
+          ]);
+        }
+        setChats((current) =>
+          current.map((chat) =>
+            chat.id === chatId
+              ? { ...chat, title: chat.title === 'New chat' ? question.slice(0, 80) : chat.title, updatedAt: Date.now() }
+              : chat
+          )
+        );
 
         // Automatically highlight primary cited code if user is in code mode or no lines highlighted
-        if (json.citations && json.citations[0] && explorationMode === 'code') {
+        if (activeChatIdRef.current === chatId && json.citations && json.citations[0] && explorationMode === 'code') {
           setSelectedFilePath(json.citations[0].file_path);
           setHighlightRange({
             start_line: json.citations[0].start_line,
@@ -721,29 +1020,31 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
           });
         }
       } catch (err) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `err_${Date.now()}`,
-            role: 'assistant',
-            content: '',
-            timestamp: new Date().toISOString(),
-            error: err instanceof Error ? err.message : 'Chat request failed.',
-          },
-        ]);
+        if (!chatId || activeChatIdRef.current === chatId) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `err_${Date.now()}`,
+              role: 'assistant',
+              content: '',
+              timestamp: new Date().toISOString(),
+              error: err instanceof Error ? err.message : 'Chat request failed.',
+            },
+          ]);
+        }
       } finally {
         setChatLoading(false);
       }
     },
     [
       currentChatContext,
-      messages,
-      targetRepoId,
       explorationMode,
       credentials,
       updateCredentials,
       readOnly,
       navigate,
+      createChat,
+      apiFetch,
     ]
   );
 
@@ -1108,7 +1409,19 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
                 onClearAttachedCode={() => setAttachedCode(undefined)}
                 onAttachCode={(att) => void handleAttachCode(att)}
                 onSendMessage={(q) => void sendQuestion(q)}
-                onClearChat={() => setMessages([])}
+                onClearChat={() => void clearChats()}
+                chats={chats}
+                activeChatId={activeChatId}
+                loadingChats={loadingChats}
+                chatError={chatError}
+                hasMoreMessages={hasMoreMessages}
+                loadingOlderMessages={loadingOlderMessages}
+                onCreateChat={() => void createChat()}
+                onSelectChat={(chatId) => void selectChat(chatId)}
+                onRenameChat={(chatId, title) => void renameChat(chatId, title)}
+                onDeleteChat={(chatId) => void deleteChat(chatId)}
+                onExportChat={(chatId, format) => void exportChat(chatId, format)}
+                onLoadOlderMessages={() => void loadOlderMessages()}
                 onOpenCitation={(fp, s, e) => openCodeLocation(fp, s, e)}
                 onTraceCode={handleTraceCode}
               />}
@@ -1130,10 +1443,17 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
           {/* Panel B: File Explorer */}
           {!filesCollapsed && (
             <div style={{ width: `${midWidth}%` }} className="h-full min-w-[200px] shrink-0">
+              {progressError && (
+                <p role="alert" className="border-b border-rose-900/50 bg-rose-950/30 px-3 py-2 text-[11px] text-rose-300">
+                  {progressError}
+                </p>
+              )}
               <FileExplorerPanel
                 tree={tree}
                 filesMeta={filesMeta}
                 selectedFilePath={selectedFilePath}
+                exploredItemIds={exploredItemIds}
+                exploredCount={exploredItemIds.size}
                 onSelectFile={handleSelectFile}
                 onCollapse={() => setFilesCollapsed(true)}
                 incomingDeps={fileData?.incomingDependencies ?? []}
@@ -1207,6 +1527,8 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
                   setExplorationMode('diagrams');
                 }}
                 onAskQuestion={(q) => void sendQuestion(q)}
+                completedSteps={completedTourSteps}
+                onCompleteStep={(stepIndex) => void markTourStepComplete(stepIndex)}
               />
             )}
           </div>

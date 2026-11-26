@@ -52,6 +52,7 @@ export function SettingsPage() {
   const {
     preferences,
     updatePreferences,
+    preferencesError,
     user,
     credentials,
     updateCredentials,
@@ -560,6 +561,37 @@ export function SettingsPage() {
               {preferences.showMinimap ? 'Enabled' : 'Disabled'}
             </button>
           </div>
+
+          <div className="flex items-center justify-between gap-4 border-t border-[#232832] pt-5">
+            <div>
+              <label htmlFor="chat-retention" className="text-xs font-semibold text-[#F3F4F6]">
+                Chat History Retention
+              </label>
+              <p className="text-[11px] text-[#9CA3AF]">
+                Automatically delete your chats after this many days.
+              </p>
+            </div>
+            <select
+              id="chat-retention"
+              value={preferences.chatRetentionDays}
+              onChange={(e) => updatePreferences({ chatRetentionDays: Number(e.target.value) })}
+              className="rounded border border-[#232832] bg-[#0B0D10] px-3 py-1.5 text-xs text-[#E6E9EF]"
+            >
+              <option value={0}>Keep indefinitely</option>
+              <option value={7}>7 days</option>
+              <option value={30}>30 days</option>
+              <option value={90}>90 days</option>
+              <option value={180}>180 days</option>
+              <option value={365}>365 days</option>
+              <option value={730}>2 years</option>
+              <option value={3650}>10 years</option>
+            </select>
+          </div>
+          {preferencesError && (
+            <p role="alert" className="border-t border-[#232832] pt-3 text-[11px] text-rose-300">
+              {preferencesError}
+            </p>
+          )}
 
           <div className="flex items-center justify-between gap-4 border-t border-[#232832] pt-5">
             <div>

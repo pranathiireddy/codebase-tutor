@@ -336,8 +336,7 @@ export async function generateGroundedExplanation(
   ].join('\n');
 
   const recentHistory = history
-    .slice(-4)
-    .map((m) => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.content.slice(0, 600)}`)
+    .map((m) => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.content}`)
     .join('\n\n');
 
   const prompt = [

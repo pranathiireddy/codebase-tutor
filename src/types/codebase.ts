@@ -338,6 +338,29 @@ export interface ChatMessage {
   error?: string;
 }
 
+export interface ChatRecord {
+  id: string;
+  userId: string;
+  repositoryId: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ChatMessageCursor {
+  createdAt: number;
+  id: string;
+}
+
+export interface ChatProgress {
+  exploredItems: string[];
+  tourProgress: { tourId: string; stepIndex: number; completedAt: number }[];
+  exploredCount: number;
+  totalFiles: number;
+  completedTourCount: number;
+  totalTourSteps: number;
+}
+
 export interface UserProfile {
   id: string;
   name: string;

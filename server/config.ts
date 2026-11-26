@@ -10,6 +10,8 @@ const configSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   JSON_BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(2 * 1024 * 1024),
+  CHAT_HISTORY_MAX_MESSAGES: z.coerce.number().int().min(1).max(100).default(20),
+  CHAT_HISTORY_MAX_CHARS: z.coerce.number().int().min(256).max(100000).default(12000),
   MAX_ARCHIVE_BYTES: z.coerce.number().int().positive().default(25 * 1024 * 1024),
   MAX_REPOSITORY_FILES: z.coerce.number().int().positive().default(2500),
   MAX_TEXT_FILE_BYTES: z.coerce.number().int().positive().default(350 * 1024),
@@ -23,7 +25,10 @@ const configSchema = z.object({
     z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 32-byte hexadecimal key').optional()
   ),
   DATABASE_PATH: z.string().trim().min(1).default('.codebase-tutor-cache/codebase-tutor.sqlite'),
-  ALLOWED_ORIGINS: z.string().trim().default('http://localhost:3000,http://localhost:5173'),
+  ALLOWED_ORIGINS: z
+    .string()
+    .trim()
+    .default('http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173'),
   GEMINI_API_KEY: z.string().trim().optional(),
   GITHUB_TOKEN: z.string().trim().optional(),
 });
@@ -65,6 +70,8 @@ export const config = Object.freeze({
   nodeEnv: env.NODE_ENV,
   port: env.PORT,
   jsonBodyLimitBytes: env.JSON_BODY_LIMIT_BYTES,
+  chatHistoryMaxMessages: env.CHAT_HISTORY_MAX_MESSAGES,
+  chatHistoryMaxChars: env.CHAT_HISTORY_MAX_CHARS,
   maxArchiveBytes: env.MAX_ARCHIVE_BYTES,
   maxRepositoryFiles: env.MAX_REPOSITORY_FILES,
   maxTextFileBytes: env.MAX_TEXT_FILE_BYTES,
