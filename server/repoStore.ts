@@ -8,6 +8,7 @@ import {
 import { analyzeRepositoryFiles, type AnalysisResult } from './analyzer.ts';
 import { buildKnowledgeGraph } from './graph.ts';
 import { buildSequenceDiagram, generateAllDiagrams, generateWalkthrough } from './diagrams.ts';
+import { getPublicRepositoryOwner, setPublicRepositoryOwner } from './db/index.ts';
 import type {
   AnalysisStage,
   DiagramPayload,
@@ -24,12 +25,16 @@ export interface AnalyzedRepoData {
   analysis: AnalysisResult;
   graph: KnowledgeGraph;
   diagrams: Record<DiagramType, DiagramPayload>;
+  ownerUserId?: string;
 }
 
 const CACHE_DIR = path.resolve(process.cwd(), '.codebase-tutor-cache');
 const repoStore = new Map<string, AnalyzedRepoData>();
 const recordStore = new Map<string, RepositoryRecord>();
+const ownerByRepositoryId = new Map<string, string | undefined>();
 const inFlightJobs = new Map<string, Promise<RepositoryRecord>>();
+const privateLastAccessedAt = new Map<string, number>();
+let privateEvictionTimer: ReturnType<typeof setInterval> | undefined;
 
 function ensureCacheDir(): void {
   if (!fs.existsSync(CACHE_DIR)) {
@@ -37,8 +42,10 @@ function ensureCacheDir(): void {
   }
 }
 
-function makeRepoId(owner: string, name: string): string {
-  return `${owner.toLowerCase()}__${name.toLowerCase()}`;
+function makeRepoId(owner: string, name: string, userId?: string): string {
+  const repositoryPart = `${owner.toLowerCase()}__${name.toLowerCase()}`;
+  if (repositoryPart === PONYTAIL_REPO_ID) return PONYTAIL_REPO_ID;
+  return userId ? `${userId}__${repositoryPart}` : repositoryPart;
 }
 
 function getCacheFilePath(repoId: string, commitSha: string): string {
@@ -86,11 +93,15 @@ function updateStage(id: string, stage: AnalysisStage, progress: number, stageMe
 
 export async function startRepositoryAnalysis(
   rawUrl: string,
-  options?: { forceRefresh?: boolean; githubToken?: string }
+  options?: { forceRefresh?: boolean; githubToken?: string; userId?: string }
 ): Promise<RepositoryRecord> {
   const parsed = parseGitHubUrl(rawUrl);
-  const id = makeRepoId(parsed.owner, parsed.name);
-  const isFeaturedDemo = id === PONYTAIL_REPO_ID;
+  const canonicalId = makeRepoId(parsed.owner, parsed.name);
+  const isFeaturedDemo = canonicalId === PONYTAIL_REPO_ID;
+  if (!isFeaturedDemo && !options?.userId) {
+    throw new Error('Sign in is required to analyze repositories.');
+  }
+  const id = makeRepoId(parsed.owner, parsed.name, options?.userId);
 
   // Return existing in-flight job if already running
   const running = inFlightJobs.get(id);
@@ -115,11 +126,15 @@ export async function startRepositoryAnalysis(
     stageMessage: 'Validating GitHub repository URL...',
   };
   recordStore.set(id, initialRecord);
+  ownerByRepositoryId.set(id, isFeaturedDemo ? undefined : options?.userId);
 
   const jobPromise = (async (): Promise<RepositoryRecord> => {
     try {
       updateStage(id, 'fetching', 18, `Fetching metadata for ${parsed.fullName} from GitHub...`);
       const meta = await fetchGitHubRepoMetadata(parsed, options?.githubToken);
+      if (meta.isPrivate && options?.userId) {
+        privateLastAccessedAt.set(id, Date.now());
+      }
 
       updateStage(id, 'fetching', 25, `Resolved commit ${meta.commitSha.slice(0, 7)} on branch ${meta.defaultBranch}`, {
         description: meta.description,
@@ -207,11 +222,14 @@ export async function startRepositoryAnalysis(
         analysis,
         graph,
         diagrams,
+        ownerUserId: isFeaturedDemo ? undefined : options?.userId,
       };
 
       repoStore.set(id, fullData);
       recordStore.set(id, finalRecord);
+      ownerByRepositoryId.set(id, fullData.ownerUserId);
       if (!meta.isPrivate) {
+        if (options?.userId) setPublicRepositoryOwner(id, options.userId);
         saveToDiskCache(fullData);
       }
       return finalRecord;
@@ -228,8 +246,10 @@ export async function startRepositoryAnalysis(
   return recordStore.get(id)!;
 }
 
-export function listRepositories(): RepositoryRecord[] {
-  const list = Array.from(recordStore.values());
+export function listRepositories(userId?: string): RepositoryRecord[] {
+  const list = Array.from(recordStore.values()).filter(
+    (record) => record.isFeaturedDemo || (userId && ownerByRepositoryId.get(record.id) === userId)
+  );
   // Ensure Ponytail featured demo is always first
   return list.sort((a, b) => {
     if (a.isFeaturedDemo !== b.isFeaturedDemo) return a.isFeaturedDemo ? -1 : 1;
@@ -237,21 +257,38 @@ export function listRepositories(): RepositoryRecord[] {
   });
 }
 
-export function getRepositoryRecord(id: string): RepositoryRecord | undefined {
-  return recordStore.get(id);
+export function getRepositoryRecord(id: string, userId?: string): RepositoryRecord | undefined {
+  const record = recordStore.get(id);
+  if (!record) return undefined;
+  const ownerUserId = ownerByRepositoryId.get(id);
+  if (!record.isFeaturedDemo && (!userId || ownerUserId !== userId)) return undefined;
+  if (privateLastAccessedAt.has(id)) privateLastAccessedAt.set(id, Date.now());
+  return record;
 }
 
-export function getAnalyzedRepo(id: string): AnalyzedRepoData | undefined {
-  return repoStore.get(id);
+export function getAnalyzedRepo(id: string, userId?: string): AnalyzedRepoData | undefined {
+  const data = repoStore.get(id);
+  if (!data) return undefined;
+  if (!data.record.isFeaturedDemo && (!userId || data.ownerUserId !== userId)) return undefined;
+  if (privateLastAccessedAt.has(id)) privateLastAccessedAt.set(id, Date.now());
+  return data;
 }
 
-export function clearRepositoryCache(): number {
+export function clearRepositoryCache(userId: string): number {
   let cleared = 0;
   if (fs.existsSync(CACHE_DIR)) {
     for (const file of fs.readdirSync(CACHE_DIR)) {
       if (file.endsWith('.json')) {
-        fs.unlinkSync(path.join(CACHE_DIR, file));
-        cleared++;
+        const filePath = path.join(CACHE_DIR, file);
+        try {
+          const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as AnalyzedRepoData;
+          if (parsed.ownerUserId === userId) {
+            fs.unlinkSync(filePath);
+            cleared++;
+          }
+        } catch {
+          continue;
+        }
       }
     }
   }
@@ -259,7 +296,7 @@ export function clearRepositoryCache(): number {
 }
 
 export function initializeFeaturedDemo(): void {
-  // Restore any previously cached snapshots from disk so imported repos survive server restarts
+  // Restore only the public demo and snapshots with a persisted owner association.
   try {
     if (fs.existsSync(CACHE_DIR)) {
       for (const file of fs.readdirSync(CACHE_DIR)) {
@@ -267,11 +304,17 @@ export function initializeFeaturedDemo(): void {
         try {
           const raw = fs.readFileSync(path.join(CACHE_DIR, file), 'utf8');
           const parsed = JSON.parse(raw) as AnalyzedRepoData;
-          if (parsed?.record?.id && parsed.record.stage === 'ready') {
+          const isFeaturedDemo = parsed?.record?.id === PONYTAIL_REPO_ID && parsed.record.isFeaturedDemo;
+          const ownerUserId = parsed?.ownerUserId;
+          const hasPersistedOwner =
+            typeof ownerUserId === 'string' &&
+            getPublicRepositoryOwner(parsed.record.id) === ownerUserId;
+          if (parsed?.record?.id && parsed.record.stage === 'ready' && (isFeaturedDemo || hasPersistedOwner)) {
             parsed.record.fromCache = true;
             parsed.diagrams.sequence = buildSequenceDiagram(parsed.record.id, parsed.analysis, parsed.graph);
             repoStore.set(parsed.record.id, parsed);
             recordStore.set(parsed.record.id, parsed.record);
+            ownerByRepositoryId.set(parsed.record.id, ownerUserId);
             saveToDiskCache(parsed);
           }
         } catch {
@@ -303,4 +346,21 @@ export function initializeFeaturedDemo(): void {
   }
   // Pre-warm Ponytail through the exact same generic pipeline
   void startRepositoryAnalysis(PONYTAIL_REPO_URL);
+}
+
+function evictIdlePrivateAnalyses(now = Date.now()): void {
+  const idleLimitMs = 2 * 60 * 60 * 1000;
+  for (const [id, lastAccessedAt] of privateLastAccessedAt) {
+    if (now - lastAccessedAt < idleLimitMs || inFlightJobs.has(id)) continue;
+    privateLastAccessedAt.delete(id);
+    repoStore.delete(id);
+    recordStore.delete(id);
+    ownerByRepositoryId.delete(id);
+  }
+}
+
+export function startPrivateAnalysisEviction(): void {
+  if (privateEvictionTimer) return;
+  privateEvictionTimer = setInterval(evictIdlePrivateAnalyses, 60_000);
+  privateEvictionTimer.unref();
 }

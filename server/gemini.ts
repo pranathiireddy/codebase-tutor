@@ -2,6 +2,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import type { ChatCitation, ChatContext } from '../src/types/codebase.ts';
 import type { AnalyzedRepoData } from './repoStore.ts';
 import { retrieveRepositoryEvidence } from './retriever.ts';
+import { config } from './config.ts';
 
 let cachedAi: GoogleGenAI | null = null;
 let cachedApiKey: string | null = null;
@@ -64,12 +65,16 @@ function createTtsGenAIClient(apiKey: string, isServerKey: boolean): GoogleGenAI
 
 function getGeminiClient(apiKeyOverride?: string): { ai: GoogleGenAI; isServerKey: boolean } {
   const custom = sanitizeKey(apiKeyOverride);
-  const envKey = sanitizeKey(process.env.GEMINI_API_KEY);
+  const envKey = config.allowServerKey ? sanitizeKey(config.geminiApiKey) : '';
   const isServerKey = !custom;
   const apiKey = custom || envKey;
 
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error('GEMINI_API_KEY is not configured. Please enter your Gemini API key in Settings.');
+    throw new Error(
+      config.allowServerKey
+        ? 'GEMINI_API_KEY is not configured. Please enter your Gemini API key in Settings.'
+        : 'Server Gemini key use is disabled. Please enter your own Gemini API key in Settings.'
+    );
   }
   if (!cachedAi || cachedApiKey !== apiKey) {
     cachedAi = createGenAIClient(apiKey, isServerKey);
@@ -80,12 +85,16 @@ function getGeminiClient(apiKeyOverride?: string): { ai: GoogleGenAI; isServerKe
 
 function getTtsGeminiClient(apiKeyOverride?: string): { ai: GoogleGenAI; isServerKey: boolean } {
   const custom = sanitizeKey(apiKeyOverride);
-  const envKey = sanitizeKey(process.env.GEMINI_API_KEY);
+  const envKey = config.allowServerKey ? sanitizeKey(config.geminiApiKey) : '';
   const isServerKey = !custom;
   const apiKey = custom || envKey;
 
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error('GEMINI_API_KEY is not configured. Please enter your Gemini API key in Settings.');
+    throw new Error(
+      config.allowServerKey
+        ? 'GEMINI_API_KEY is not configured. Please enter your Gemini API key in Settings.'
+        : 'Server Gemini key use is disabled. Please enter your own Gemini API key in Settings.'
+    );
   }
   return { ai: createTtsGenAIClient(apiKey, isServerKey), isServerKey };
 }

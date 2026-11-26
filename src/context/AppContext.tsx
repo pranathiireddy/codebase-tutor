@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
 import type { DiagramType, UserProfile } from '../types/codebase';
 
 export interface WorkspacePreferences {
@@ -24,6 +24,7 @@ export interface CredentialStatus {
 interface AppContextValue {
   user: UserProfile | null;
   authToken: string | null;
+  authLoading: boolean;
   setSession: (user: UserProfile | null, token: string | null) => void;
   logout: () => Promise<void>;
   preferences: WorkspacePreferences;
@@ -36,6 +37,7 @@ interface AppContextValue {
 }
 
 const SESSION_CREDS_KEY = 'codebase_tutor_session_creds_v1';
+const SESSION_AUTH_KEY = 'codebase_tutor_auth_token_v1';
 
 const DEFAULT_CREDENTIALS: UserApiCredentials = {
   geminiApiKey: '',
@@ -82,6 +84,7 @@ const AppContext = createContext<AppContextValue | undefined>(undefined);
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<UserProfile | null>(null);
   const [authToken, setAuthToken] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [preferences, setPreferences] = useState<WorkspacePreferences>({
     editorFontSize: 13,
     defaultDiagramType: 'system_architecture',
@@ -93,9 +96,66 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     githubVerified: null,
   });
 
+  useEffect(() => {
+    let cancelled = false;
+    let token: string | null = null;
+    try {
+      token = window.sessionStorage.getItem(SESSION_AUTH_KEY);
+    } catch {
+      setAuthLoading(false);
+      return;
+    }
+
+    if (!token) {
+      setAuthLoading(false);
+      return;
+    }
+
+    void fetch('/api/auth/me', { headers: { Authorization: `Bearer ${token}` } })
+      .then(async (res) => {
+        if (!res.ok) throw new Error('Stored session is no longer valid.');
+        return (await res.json()) as { user?: UserProfile };
+      })
+      .then((response) => {
+        if (!cancelled && response.user) {
+          setUser(response.user);
+          setAuthToken(token);
+        }
+      })
+      .catch(() => {
+        try {
+          window.sessionStorage.removeItem(SESSION_AUTH_KEY);
+        } catch {
+          // Session state remains cleared in memory.
+        }
+        if (!cancelled) {
+          setCredentials(DEFAULT_CREDENTIALS);
+          saveSessionCredentials(DEFAULT_CREDENTIALS);
+          setCredentialStatus({ geminiVerified: null, githubVerified: null });
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setAuthLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const setSession = useCallback((nextUser: UserProfile | null, nextToken: string | null) => {
     setUser(nextUser);
     setAuthToken(nextToken);
+    setAuthLoading(false);
+    setCredentials(DEFAULT_CREDENTIALS);
+    saveSessionCredentials(DEFAULT_CREDENTIALS);
+    setCredentialStatus({ geminiVerified: null, githubVerified: null });
+    try {
+      if (nextToken) window.sessionStorage.setItem(SESSION_AUTH_KEY, nextToken);
+      else window.sessionStorage.removeItem(SESSION_AUTH_KEY);
+    } catch {
+      // The active session remains usable until this page is closed.
+    }
   }, []);
 
   const logout = useCallback(async () => {
@@ -111,6 +171,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
     setUser(null);
     setAuthToken(null);
+    setCredentials(DEFAULT_CREDENTIALS);
+    saveSessionCredentials(DEFAULT_CREDENTIALS);
+    setCredentialStatus({ geminiVerified: null, githubVerified: null });
+    try {
+      window.sessionStorage.removeItem(SESSION_AUTH_KEY);
+    } catch {
+      // Session state remains cleared in memory.
+    }
   }, [authToken]);
 
   const updatePreferences = useCallback((partial: Partial<WorkspacePreferences>) => {
@@ -136,6 +204,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       value={{
         user,
         authToken,
+        authLoading,
         setSession,
         logout,
         preferences,

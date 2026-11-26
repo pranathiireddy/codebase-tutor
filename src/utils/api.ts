@@ -2,6 +2,7 @@ export interface ApiCredentialHeaders {
   geminiApiKey?: string;
   geminiModel?: string;
   githubToken?: string;
+  authToken?: string;
 }
 
 export class ApiHtmlFallbackError extends Error {
@@ -18,6 +19,9 @@ export function buildApiHeaders(
   extra?: Record<string, string>
 ): Record<string, string> {
   const headers: Record<string, string> = { ...(extra ?? {}) };
+  if (creds?.authToken?.trim()) {
+    headers.Authorization = `Bearer ${creds.authToken.trim()}`;
+  }
   if (creds?.geminiApiKey?.trim()) {
     headers['x-gemini-api-key'] = creds.geminiApiKey.trim();
   }

@@ -12,11 +12,10 @@ import {
   Trash2,
   ArrowRight,
 } from 'lucide-react';
-import { GoogleGenAI } from '@google/genai';
 import { TopNav } from '../components/TopNav';
 import { useApp } from '../context/AppContext';
 import type { DiagramType } from '../types/codebase';
-import { ApiHtmlFallbackError, safeJson } from '../utils/api';
+import { buildApiHeaders, safeJson } from '../utils/api';
 
 interface ServerKeyStatus {
   hasServerGeminiKey: boolean;
@@ -54,6 +53,7 @@ export function SettingsPage() {
     preferences,
     updatePreferences,
     user,
+    authToken,
     credentials,
     updateCredentials,
     clearCredentials,
@@ -88,7 +88,9 @@ export function SettingsPage() {
     let cancelled = false;
     async function loadServerStatus() {
       try {
-        const res = await fetch('/api/settings/status');
+        const res = await fetch('/api/settings/status', {
+          headers: buildApiHeaders({ authToken: authToken ?? undefined }),
+        });
         if (res.ok && !cancelled) {
           const data = await safeJson<ServerKeyStatus>(res);
           setServerStatus(data);
@@ -116,64 +118,6 @@ export function SettingsPage() {
       setModelPreset('custom');
       setCustomModel(resolvedModel);
     }
-  };
-
-  const verifyDirectlyInBrowser = async (
-    trimmedGemini: string,
-    model: string,
-    trimmedGithub: string
-  ): Promise<VerifyResponse> => {
-    const out: VerifyResponse = {};
-    if (trimmedGemini) {
-      const ai = new GoogleGenAI({ apiKey: trimmedGemini });
-      const candidates = [model, 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'].filter(
-        (v, i, arr) => arr.indexOf(v) === i
-      );
-      let okModel: string | null = null;
-      let lastErr = 'Unable to verify Gemini API key.';
-      for (const candidate of candidates) {
-        try {
-          await ai.models.generateContent({ model: candidate, contents: 'Reply with OK.' });
-          okModel = candidate;
-          break;
-        } catch (err) {
-          lastErr = err instanceof Error ? err.message : String(err);
-          if (lastErr.includes('API_KEY_INVALID') || lastErr.includes('API key not valid') || lastErr.includes('leaked')) {
-            break;
-          }
-        }
-      }
-      out.gemini = okModel
-        ? {
-            valid: true,
-            model: okModel,
-            note: okModel !== model ? `Switched model from ${model} to ${okModel} for compatibility.` : undefined,
-          }
-        : { valid: false, model, error: lastErr.slice(0, 200) };
-    }
-    if (trimmedGithub) {
-      try {
-        const ghHeaders = {
-          Accept: 'application/vnd.github+json',
-          Authorization: `Bearer ${trimmedGithub}`,
-        };
-        let ghRes = await fetch('https://api.github.com/user', { headers: ghHeaders });
-        if (ghRes.status === 403) {
-          ghRes = await fetch('https://api.github.com/rate_limit', { headers: ghHeaders });
-        }
-        const rem = Number(ghRes.headers.get('x-ratelimit-remaining') ?? '0');
-        const lim = Number(ghRes.headers.get('x-ratelimit-limit') ?? '0');
-        if (ghRes.ok) {
-          const data = (await ghRes.json()) as { login?: string };
-          out.github = { valid: true, username: data.login ?? 'token', remaining: rem, limit: lim };
-        } else {
-          out.github = { valid: false, error: `GitHub verification returned status ${ghRes.status}.` };
-        }
-      } catch (err) {
-        out.github = { valid: false, error: err instanceof Error ? err.message : 'GitHub request failed.' };
-      }
-    }
-    return out;
   };
 
   const handleSaveAndVerify = async (e: React.FormEvent) => {
@@ -204,26 +148,18 @@ export function SettingsPage() {
     setVerifying(true);
     try {
       let json: VerifyResponse & { error?: string };
-      try {
-        const res = await fetch('/api/settings/verify', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            geminiApiKey: trimmedGemini || undefined,
-            geminiModel: effectiveModel,
-            githubToken: trimmedGithub || undefined,
-          }),
-        });
-        json = await safeJson<VerifyResponse & { error?: string }>(res);
-        if (!res.ok) {
-          throw new Error(json.error || 'Failed to verify credentials.');
-        }
-      } catch (err) {
-        if (err instanceof ApiHtmlFallbackError) {
-          json = await verifyDirectlyInBrowser(trimmedGemini, effectiveModel, trimmedGithub);
-        } else {
-          throw err;
-        }
+      const res = await fetch('/api/settings/verify', {
+        method: 'POST',
+        headers: buildApiHeaders({ authToken: authToken ?? undefined }, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          geminiApiKey: trimmedGemini || undefined,
+          geminiModel: effectiveModel,
+          githubToken: trimmedGithub || undefined,
+        }),
+      });
+      json = await safeJson<VerifyResponse & { error?: string }>(res);
+      if (!res.ok) {
+        throw new Error(json.error || 'Failed to verify credentials.');
       }
 
       if (json.gemini?.valid && json.gemini.model && json.gemini.model !== effectiveModel) {
@@ -275,7 +211,10 @@ export function SettingsPage() {
     setClearing(true);
     setCacheMessage(null);
     try {
-      const res = await fetch('/api/cache/clear', { method: 'POST' });
+      const res = await fetch('/api/cache/clear', {
+        method: 'POST',
+        headers: buildApiHeaders({ authToken: authToken ?? undefined }),
+      });
       const json = await safeJson<{ cleared?: number }>(res);
       setCacheMessage(`Cleared ${json.cleared ?? 0} cached commit snapshot(s).`);
     } catch {

@@ -406,8 +406,7 @@ export function ChatPanel({
     };
   }, []);
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const submitInput = () => {
     if (!input.trim() || loading) return;
     if (recognitionRef.current) {
       recognitionRef.current.onresult = null;
@@ -418,6 +417,11 @@ export function ChatPanel({
     }
     onSendMessage(input.trim());
     setInput('');
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    submitInput();
   };
 
   const startVoiceInput = () => {
@@ -919,10 +923,7 @@ export function ChatPanel({
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                if (input.trim() && !loading) {
-                  onSendMessage(input.trim());
-                  setInput('');
-                }
+                submitInput();
               }
             }}
             placeholder={

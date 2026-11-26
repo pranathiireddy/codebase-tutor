@@ -28,17 +28,20 @@ import {
 } from 'lucide-react';
 import mermaid from 'mermaid';
 import type {
+  AnalyzedFileMeta,
   DiagramPayload,
   DiagramType,
   DiagramVisualEdge,
   DiagramVisualNode,
   ExtractedSymbol,
 } from '../types/codebase';
-import { safeJson } from '../utils/api';
+import { buildApiHeaders, safeJson } from '../utils/api';
 import { MermaidDiagram } from './MermaidDiagram';
 
 interface DiagramExplorerPanelProps {
   repositoryId: string;
+  authToken?: string | null;
+  filesMeta: AnalyzedFileMeta[];
   activeDiagramType: DiagramType;
   onChangeDiagramType: (type: DiagramType) => void;
   selectedGraphNodeId: string | null;
@@ -375,6 +378,8 @@ function ConfidenceLabel({ level }: { level: 'verified' | 'inferred' | 'uncertai
 
 export function DiagramExplorerPanel({
   repositoryId,
+  authToken,
+  filesMeta,
   activeDiagramType,
   onChangeDiagramType,
   selectedGraphNodeId,
@@ -490,7 +495,9 @@ export function DiagramExplorerPanel({
       setExpandedNodeDetails(null);
       setActiveScenarioIdx(0);
       try {
-        const res = await fetch(`/api/repositories/${encodeURIComponent(repositoryId)}/diagrams/${activeDiagramType}`);
+        const res = await fetch(`/api/repositories/${encodeURIComponent(repositoryId)}/diagrams/${activeDiagramType}`, {
+          headers: buildApiHeaders({ authToken: authToken ?? undefined }),
+        });
         const json = await safeJson<{ diagram?: DiagramPayload; error?: string }>(res);
         if (!res.ok || !json.diagram) {
           throw new Error(json.error || 'Failed to load diagram.');
@@ -510,7 +517,7 @@ export function DiagramExplorerPanel({
     return () => {
       cancelled = true;
     };
-  }, [repositoryId, activeDiagramType]);
+  }, [repositoryId, activeDiagramType, authToken]);
 
   useEffect(() => {
     if (!diagram) return;
@@ -527,7 +534,8 @@ export function DiagramExplorerPanel({
 
     try {
       const res = await fetch(
-        `/api/repositories/${encodeURIComponent(repositoryId)}/diagrams/${activeDiagramType}/nodes/${encodeURIComponent(visualNode.id)}`
+        `/api/repositories/${encodeURIComponent(repositoryId)}/diagrams/${activeDiagramType}/nodes/${encodeURIComponent(visualNode.id)}`,
+        { headers: buildApiHeaders({ authToken: authToken ?? undefined }) }
       );
       if (res.ok) {
         const details = await safeJson<{
@@ -540,6 +548,13 @@ export function DiagramExplorerPanel({
     } catch {
       // ignore inspector fetch error
     }
+  };
+
+  const handleChangeDiagramType = (type: DiagramType) => {
+    setSelectedNode(null);
+    setSelectedEdge(null);
+    setExpandedNodeDetails(null);
+    onChangeDiagramType(type);
   };
 
   // Compute connected path node IDs automatically when any node is selected
@@ -633,6 +648,65 @@ export function DiagramExplorerPanel({
   const activeScenario = diagram?.scenarios?.[activeScenarioIdx];
   const selectedNodeIndex =
     diagram && selectedNode ? diagram.nodes.findIndex((node) => node.id === selectedNode.id) : -1;
+  const selectedFileMeta = useMemo(
+    () => (selectedNode?.file_path ? filesMeta.find((file) => file.path === selectedNode.file_path) : undefined),
+    [filesMeta, selectedNode?.file_path]
+  );
+  const selectedFileDetails = useMemo(() => {
+    if (!selectedFileMeta) return '';
+    if (selectedFileMeta.exports.length > 0) {
+      const visibleExports = selectedFileMeta.exports.slice(0, 3);
+      const remainingCount = selectedFileMeta.exports.length - visibleExports.length;
+      return `Exports ${visibleExports.join(', ')}${remainingCount > 0 ? `, plus ${remainingCount} more` : ''}.`;
+    }
+    if (selectedFileMeta.entryPointReason) {
+      return `Entry point: ${selectedFileMeta.entryPointReason}.`;
+    }
+    const importLabel = selectedFileMeta.imports.length === 1 ? 'import' : 'imports';
+    return `Contains ${selectedFileMeta.symbolIds.length} analyzed symbols and uses ${selectedFileMeta.imports.length} ${importLabel}.`;
+  }, [selectedFileMeta]);
+  const nodeRelationshipSummary = useMemo(() => {
+    if (!diagram || !selectedNode) return '';
+
+    const connections = diagram.edges.filter(
+      (edge) => edge.source === selectedNode.id || edge.target === selectedNode.id
+    );
+    if (connections.length === 0) {
+      return 'No direct connections are recorded for this node, so this diagram does not specify shared data.';
+    }
+
+    const edge = connections[0];
+    const isOutgoing = edge.source === selectedNode.id;
+    const otherNodeId = isOutgoing ? edge.target : edge.source;
+    const otherNode = diagram.nodes.find((node) => node.id === otherNodeId);
+    if (!otherNode) {
+      return 'A direct connection is recorded, but the related node details are unavailable.';
+    }
+
+    const relationship = edge.label || edge.relationship.replace(/_/g, ' ');
+    let sharedInformation = edge.explanation;
+    if (!sharedInformation && edge.relationship === 'inherits') {
+      sharedInformation = isOutgoing
+        ? `It inherits methods and fields from ${otherNode.label}.`
+        : `${otherNode.label} inherits methods and fields from this node.`;
+    } else if (!sharedInformation && edge.relationship === 'implements') {
+      sharedInformation = isOutgoing
+        ? `It fulfills the contract defined by ${otherNode.label}.`
+        : `${otherNode.label} fulfills this node's contract.`;
+    } else if (!sharedInformation) {
+      sharedInformation =
+        edge.relationship === 'sends_data_to'
+          ? `This flow passes ${relationship}; the exact payload is not listed.`
+          : `This shows a ${relationship} relationship; no specific data payload is recorded.`;
+    }
+
+    const moreConnections =
+      connections.length > 1 ? ` ${connections.length - 1} additional direct connection(s) are listed below.` : '';
+    return (
+      `${isOutgoing ? 'Outgoing' : 'Incoming'} relationship with ${otherNode.label}: ${relationship}. ` +
+      `Shared/context: ${sharedInformation}${moreConnections}`
+    );
+  }, [diagram, selectedNode]);
   const navigateSelectedNode = (direction: -1 | 1) => {
     if (!diagram || selectedNodeIndex < 0) return;
     const nextNode = diagram.nodes[selectedNodeIndex + direction];
@@ -677,7 +751,7 @@ export function DiagramExplorerPanel({
                 <button
                   key={tab.id}
                   type="button"
-                  onClick={() => onChangeDiagramType(tab.id)}
+                  onClick={() => handleChangeDiagramType(tab.id)}
                   className={`rounded-md px-2.5 py-1.5 text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
                     active
                       ? 'bg-sky-500/15 text-sky-300'
@@ -851,7 +925,7 @@ export function DiagramExplorerPanel({
               </p>
               <button
                 type="button"
-                onClick={() => onChangeDiagramType('system_architecture')}
+                onClick={() => handleChangeDiagramType('system_architecture')}
                 className="rounded-md border border-[#232832] bg-[#141820] px-3 py-1.5 text-xs font-medium text-[#E6E9EF] hover:border-sky-500/50 cursor-pointer"
               >
                 Return to System Architecture
@@ -977,8 +1051,35 @@ export function DiagramExplorerPanel({
         </div>
 
         {/* Explanation & Code Layer Inspector Drawer */}
-        {(selectedNode || selectedEdge) && (
+        {(selectedNode || selectedEdge || (diagram?.available && !loading && !error)) && (
           <aside className="w-80 shrink-0 overflow-y-auto border-l border-[#232832] bg-[#111419] p-4">
+            {!selectedNode && !selectedEdge && diagram?.available && (
+              <div className="space-y-3">
+                <h3 className="text-sm font-semibold text-[#F3F4F6]">Nodes</h3>
+                {diagram.nodes.length > 0 ? (
+                  <div className="space-y-2">
+                    {diagram.nodes.map((node) => (
+                      <button
+                        key={node.id}
+                        type="button"
+                        onClick={() => void handleSelectNode(node)}
+                        aria-label={`Select ${node.label}`}
+                        className="block w-full rounded-md border border-[#232832] bg-[#0D1015] p-2.5 text-left hover:border-sky-500/50 transition-colors"
+                      >
+                        <span className="block truncate text-xs font-medium text-[#E6E9EF]">
+                          {node.label}
+                        </span>
+                        <span className="mt-1 line-clamp-2 block text-[11px] leading-relaxed text-[#9CA3AF]">
+                          {node.description || 'No description available.'}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-[#9CA3AF]">No nodes are available in this diagram.</p>
+                )}
+              </div>
+            )}
             {selectedNode && (
               <div className="space-y-4">
                 <div>
@@ -1024,6 +1125,33 @@ export function DiagramExplorerPanel({
                 <p className="text-xs leading-relaxed text-[#D1D5DB]">
                   {selectedNode.description}
                 </p>
+
+                <div className="rounded-md border border-[#232832] bg-[#0D1015] p-2.5">
+                  <h4 className="mb-1 text-[11px] font-semibold text-sky-300">
+                    Relationship & shared data
+                  </h4>
+                  <p className="text-xs leading-relaxed text-[#9CA3AF]">{nodeRelationshipSummary}</p>
+                </div>
+
+                {selectedNode.file_path && (
+                  <div className="rounded-md border border-[#232832] bg-[#0D1015] p-2.5">
+                    <h4 className="mb-1 text-[11px] font-semibold text-sky-300">File overview</h4>
+                    {selectedFileMeta ? (
+                      <>
+                        <p className="text-xs leading-relaxed text-[#9CA3AF]">
+                          {selectedFileMeta.summary || 'No file summary is available.'}
+                        </p>
+                        <p className="mt-1 text-xs leading-relaxed text-[#9CA3AF]">
+                          {selectedFileDetails}
+                        </p>
+                      </>
+                    ) : (
+                      <p className="text-xs leading-relaxed text-[#9CA3AF]">
+                        File overview is unavailable for this node.
+                      </p>
+                    )}
+                  </div>
+                )}
 
                 {/* Primary Actions */}
                 <div className="flex flex-col gap-2">

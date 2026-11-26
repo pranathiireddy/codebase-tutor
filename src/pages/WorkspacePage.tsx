@@ -1,9 +1,10 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   ArrowLeft,
   Code2,
   Compass,
+  Home,
   Network,
   Plus,
   RefreshCw,
@@ -20,8 +21,7 @@ import { SourceCodePanel } from '../components/SourceCodePanel';
 import { DiagramExplorerPanel } from '../components/DiagramExplorerPanel';
 import { OverviewWalkthroughPanel } from '../components/OverviewWalkthroughPanel';
 import { useApp } from '../context/AppContext';
-import { ApiHtmlFallbackError, buildApiHeaders, safeJson } from '../utils/api';
-import { generateClientFallbackExplanation } from '../utils/clientTutorFallback';
+import { buildApiHeaders, safeJson } from '../utils/api';
 import type {
   AnalyzedFileMeta,
   ChatCitation,
@@ -41,10 +41,24 @@ import type {
 
 type ExplorationMode = 'overview' | 'code' | 'diagrams';
 
-export function WorkspacePage() {
+export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
   const { repositoryId } = useParams<{ repositoryId?: string }>();
   const navigate = useNavigate();
-  const { preferences, credentials, updateCredentials, setCredentialStatus } = useApp();
+  const { preferences, credentials, authToken, updateCredentials, setCredentialStatus } = useApp();
+  const apiCredentials = useMemo(
+    () => ({ ...credentials, authToken: authToken ?? undefined }),
+    [credentials, authToken]
+  );
+  const apiFetch = useCallback(
+    (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      for (const [name, value] of Object.entries(buildApiHeaders(apiCredentials))) {
+        headers.set(name, value);
+      }
+      return fetch(input, { ...init, headers });
+    },
+    [apiCredentials]
+  );
 
   const targetRepoId = repositoryId || 'dietrichgebert__ponytail';
 
@@ -128,7 +142,7 @@ export function WorkspacePage() {
   // Load repository list
   const loadRepoList = useCallback(async () => {
     try {
-      const res = await fetch('/api/repositories');
+      const res = await apiFetch('/api/repositories');
       if (res.ok) {
         const json = await safeJson<{ repositories: RepositoryRecord[] }>(res);
         setRepositories(json.repositories);
@@ -136,7 +150,7 @@ export function WorkspacePage() {
     } catch {
       // ignore
     }
-  }, []);
+  }, [apiFetch]);
 
   // Poll target repository analysis until ready
   useEffect(() => {
@@ -156,14 +170,7 @@ export function WorkspacePage() {
 
     async function loadAnalysis() {
       try {
-        const res = await fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/analysis`);
-        if (res.status === 404 && targetRepoId === 'dietrichgebert__ponytail') {
-          await fetch('/api/repositories/analyze', {
-            method: 'POST',
-            headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ url: 'https://github.com/DietrichGebert/ponytail' }),
-          });
-        }
+        const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/analysis`);
         if (res.ok) {
           const json = await safeJson<{ repository: RepositoryRecord }>(res);
           if (cancelled) return;
@@ -171,8 +178,8 @@ export function WorkspacePage() {
 
           if (json.repository.stage === 'ready') {
             const [filesRes, graphRes] = await Promise.all([
-              fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/files`),
-              fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/graph`),
+              apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/files`),
+              apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/graph`),
             ]);
             if (filesRes.ok && !cancelled) {
               const filesJson = await safeJson<{
@@ -222,7 +229,7 @@ export function WorkspacePage() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [targetRepoId, loadRepoList]);
+  }, [targetRepoId, loadRepoList, apiFetch]);
 
   // Fetch file content whenever selectedFilePath changes
   useEffect(() => {
@@ -239,7 +246,7 @@ export function WorkspacePage() {
     async function fetchContent() {
       setFileLoading(true);
       try {
-        const res = await fetch(
+        const res = await apiFetch(
           `/api/repositories/${encodeURIComponent(targetRepoId)}/files/content?path=${encodeURIComponent(selectedFilePath!)}`
         );
         if (res.ok) {
@@ -258,7 +265,7 @@ export function WorkspacePage() {
     return () => {
       cancelled = true;
     };
-  }, [targetRepoId, selectedFilePath, repository?.stage]);
+  }, [targetRepoId, selectedFilePath, repository?.stage, apiFetch]);
 
   const openCodeLocation = useCallback(
     (filePath: string, startLine?: number, endLine?: number, symbolId?: string) => {
@@ -289,7 +296,7 @@ export function WorkspacePage() {
       const cached = fileContentCacheRef.current.get(filePath);
       if (cached) return cached;
       try {
-        const res = await fetch(
+        const res = await apiFetch(
           `/api/repositories/${encodeURIComponent(targetRepoId)}/files/content?path=${encodeURIComponent(filePath)}`
         );
         if (!res.ok) return null;
@@ -300,7 +307,7 @@ export function WorkspacePage() {
         return null;
       }
     },
-    [targetRepoId]
+    [targetRepoId, apiFetch]
   );
 
   const handleTraceCode = useCallback(
@@ -415,7 +422,7 @@ export function WorkspacePage() {
       let nodesToSearch = graphNodes;
       if (nodesToSearch.length === 0) {
         try {
-          const gRes = await fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/graph`);
+          const gRes = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/graph`);
           if (gRes.ok) {
             const gJson = await safeJson<{ graph?: KnowledgeGraph }>(gRes);
             if (gJson.graph?.nodes) {
@@ -518,7 +525,7 @@ export function WorkspacePage() {
       if (traceQuery.length >= 2) {
         try {
           const preferred = selectedFilePath || citations?.[0]?.file_path || '';
-          const traceRes = await fetch(
+          const traceRes = await apiFetch(
             `/api/repositories/${encodeURIComponent(targetRepoId)}/trace?q=${encodeURIComponent(traceQuery)}&preferredFile=${encodeURIComponent(preferred)}`
           );
           if (traceRes.ok) {
@@ -575,7 +582,16 @@ export function WorkspacePage() {
 
       return false;
     },
-    [filesMeta, selectedFilePath, fileData, graphNodes, targetRepoId, openCodeLocation, loadFileContentCached]
+    [
+      filesMeta,
+      selectedFilePath,
+      fileData,
+      graphNodes,
+      targetRepoId,
+      openCodeLocation,
+      loadFileContentCached,
+      apiFetch,
+    ]
   );
 
   const handleSelectFile = useCallback((filePath: string) => {
@@ -624,6 +640,10 @@ export function WorkspacePage() {
       overrideContext?: ChatContext,
       overrideCreds?: typeof credentials
     ) => {
+      if (readOnly) {
+        navigate('/login');
+        return;
+      }
       const credsToUse = overrideCreds ?? credentials;
       const ctxToUse = overrideContext ?? currentChatContext;
       const contextLabels: string[] = [];
@@ -657,41 +677,24 @@ export function WorkspacePage() {
           error?: string;
         };
 
-        try {
-          const res = await fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/chat`, {
-            method: 'POST',
-            headers: buildApiHeaders(credsToUse, { 'Content-Type': 'application/json' }),
-            body: JSON.stringify({
-              question,
-              context: ctxToUse,
-              history: messages
-                .filter((m) => !m.error && m.content.trim().length > 0)
-                .map((m) => ({ role: m.role, content: m.content })),
-            }),
-          });
-          json = await safeJson<typeof json>(res);
+        const res = await fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/chat`, {
+          method: 'POST',
+          headers: buildApiHeaders(
+            { ...credsToUse, authToken: authToken ?? undefined },
+            { 'Content-Type': 'application/json' }
+          ),
+          body: JSON.stringify({
+            question,
+            context: ctxToUse,
+            history: messages
+              .filter((m) => !m.error && m.content.trim().length > 0)
+              .map((m) => ({ role: m.role, content: m.content })),
+          }),
+        });
+        json = await safeJson<typeof json>(res);
 
-          if (!res.ok) {
-            throw new Error(json.error || 'Unable to generate explanation.');
-          }
-        } catch (backendErr) {
-          // If preview/static host served HTML instead of the backend /api route, fall back to direct Gemini call
-          if (backendErr instanceof ApiHtmlFallbackError && repository) {
-            json = await generateClientFallbackExplanation({
-              repository,
-              filesMeta,
-              fileData,
-              question,
-              context: ctxToUse,
-              history: messages
-                .filter((m) => !m.error && m.content.trim().length > 0)
-                .map((m) => ({ role: m.role, content: m.content })),
-              apiKey: credsToUse.geminiApiKey,
-              model: credsToUse.geminiModel,
-            });
-          } else {
-            throw backendErr;
-          }
+        if (!res.ok) {
+          throw new Error(json.error || 'Unable to generate explanation.');
         }
 
         if (
@@ -741,10 +744,10 @@ export function WorkspacePage() {
       targetRepoId,
       explorationMode,
       credentials,
+      authToken,
       updateCredentials,
-      repository,
-      filesMeta,
-      fileData,
+      readOnly,
+      navigate,
     ]
   );
 
@@ -752,31 +755,25 @@ export function WorkspacePage() {
     async (apiKey: string, retryQuestion?: string): Promise<string | null> => {
       try {
         let resolvedModel = credentials.geminiModel;
-        try {
-          const res = await fetch('/api/settings/verify', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              geminiApiKey: apiKey,
-              geminiModel: credentials.geminiModel,
-            }),
-          });
-          const json = await safeJson<{
-            gemini?: { valid: boolean; model: string; note?: string; error?: string };
-            error?: string;
-          }>(res);
-          if (!res.ok) {
-            return json.error || 'Failed to verify Gemini API key.';
-          }
-          if (!json.gemini?.valid) {
-            return json.gemini?.error || 'Gemini API key verification failed.';
-          }
-          resolvedModel = json.gemini.model || credentials.geminiModel;
-        } catch (verifyErr) {
-          if (!(verifyErr instanceof ApiHtmlFallbackError)) {
-            throw verifyErr;
-          }
+        const res = await apiFetch('/api/settings/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            geminiApiKey: apiKey,
+            geminiModel: credentials.geminiModel,
+          }),
+        });
+        const json = await safeJson<{
+          gemini?: { valid: boolean; model: string; note?: string; error?: string };
+          error?: string;
+        }>(res);
+        if (!res.ok) {
+          return json.error || 'Failed to verify Gemini API key.';
         }
+        if (!json.gemini?.valid) {
+          return json.gemini?.error || 'Gemini API key verification failed.';
+        }
+        resolvedModel = json.gemini.model || credentials.geminiModel;
 
         const nextCreds = {
           ...credentials,
@@ -800,11 +797,15 @@ export function WorkspacePage() {
         return err instanceof Error ? err.message : 'Verification failed.';
       }
     },
-    [credentials, updateCredentials, setCredentialStatus, sendQuestion]
+    [credentials, updateCredentials, setCredentialStatus, sendQuestion, apiFetch]
   );
 
   const handleQuickImport = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (readOnly) {
+      navigate('/login');
+      return;
+    }
     setImportError(null);
     let targetInput = importUrl.trim();
     if (
@@ -816,9 +817,9 @@ export function WorkspacePage() {
       targetInput = `${credentials.githubDefaultOwner.trim()}/${targetInput}`;
     }
     try {
-      const res = await fetch('/api/repositories/analyze', {
+      const res = await apiFetch('/api/repositories/analyze', {
         method: 'POST',
-        headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: targetInput }),
       });
       const json = await safeJson<{ repository?: RepositoryRecord; error?: string }>(res);
@@ -834,13 +835,17 @@ export function WorkspacePage() {
   };
 
   const handleRetryAnalysis = async () => {
+    if (readOnly) {
+      navigate('/login');
+      return;
+    }
     if (!repository) return;
-    await fetch('/api/repositories/analyze', {
+    await apiFetch('/api/repositories/analyze', {
       method: 'POST',
-      headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: repository.url, forceRefresh: true }),
     });
-    const res = await fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/analysis`);
+    const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/analysis`);
     if (res.ok) {
       const json = await safeJson<{ repository: RepositoryRecord }>(res);
       setRepository(json.repository);
@@ -863,7 +868,7 @@ export function WorkspacePage() {
           return;
         }
         try {
-          const res = await fetch(
+          const res = await apiFetch(
             `/api/repositories/${encodeURIComponent(targetRepoId)}/files/content?path=${encodeURIComponent(att.file_path)}`
           );
           if (res.ok) {
@@ -881,7 +886,7 @@ export function WorkspacePage() {
         }
       }
     },
-    [fileData, targetRepoId]
+    [fileData, targetRepoId, apiFetch]
   );
 
   return (
@@ -915,14 +920,14 @@ export function WorkspacePage() {
             )}
           </select>
 
-          <button
+          {!readOnly && <button
             type="button"
             onClick={() => setShowImportModal(true)}
             className="inline-flex items-center gap-1 rounded border border-[#232832] bg-[#161A21] px-2 py-1 text-[11px] font-medium text-[#D1D5DB] hover:border-sky-500/50 cursor-pointer whitespace-nowrap shrink-0"
           >
             <Plus className="h-3 w-3" />
             <span>Import Repo</span>
-          </button>
+          </button>}
 
           {repository?.commitSha && (
             <span className="hidden lg:inline font-mono text-[11px] tabular-nums text-[#6B7280] whitespace-nowrap">
@@ -1013,14 +1018,14 @@ export function WorkspacePage() {
           </h2>
           <p className="max-w-md text-xs text-rose-300">{repository.error || repository.stageMessage}</p>
           <div className="flex items-center gap-3">
-            <button
+            {!readOnly && <button
               type="button"
               onClick={() => void handleRetryAnalysis()}
               className="inline-flex items-center gap-1.5 rounded-md bg-sky-500 px-3.5 py-2 text-xs font-semibold text-[#0B0D10] hover:bg-sky-400 cursor-pointer"
             >
               <RefreshCw className="h-3.5 w-3.5" />
               <span>Retry Analysis</span>
-            </button>
+            </button>}
             <Link
               to="/"
               className="rounded-md border border-[#232832] px-3.5 py-2 text-xs text-[#D1D5DB] hover:text-white"
@@ -1057,27 +1062,51 @@ export function WorkspacePage() {
                   <Files className="h-4 w-4" />
                 </button>
               )}
-              <Link
-                to="/settings"
-                title="Settings"
-                aria-label="Settings"
-                className="mt-auto rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
-              >
-                <Settings className="h-4 w-4" />
-              </Link>
+              <div className="mt-auto flex flex-col gap-1">
+                <Link
+                  to="/"
+                  title="Home"
+                  aria-label="Home"
+                  className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
+                >
+                  <Home className="h-4 w-4" />
+                </Link>
+                {!readOnly && <Link
+                  to="/settings"
+                  title="Settings"
+                  aria-label="Settings"
+                  className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
+                >
+                  <Settings className="h-4 w-4" />
+                </Link>}
+              </div>
             </div>
           )}
 
           {/* Panel A: Chat */}
           {!chatCollapsed && (
             <div style={{ width: `${leftWidth}%` }} className="h-full min-w-[240px] shrink-0">
-              <ChatPanel
+              {readOnly ? (
+                <div className="flex h-full flex-col items-center justify-center gap-3 border-r border-[#232832] bg-[#111419] p-6 text-center">
+                  <MessageSquare className="h-6 w-6 text-sky-400" />
+                  <h2 className="text-sm font-semibold text-[#F3F4F6]">Explore the featured demo</h2>
+                  <p className="text-xs leading-relaxed text-[#9CA3AF]">
+                    Sign in to ask questions, import repositories, and use your own API keys.
+                  </p>
+                  <Link
+                    to="/login"
+                    className="rounded-md bg-sky-500 px-3.5 py-2 text-xs font-semibold text-[#0B0D10] hover:bg-sky-400"
+                  >
+                    Sign in
+                  </Link>
+                </div>
+              ) : <ChatPanel
                 repositoryName={repository.name}
                 onCollapse={() => setChatCollapsed(true)}
                 messages={messages}
                 loading={chatLoading}
                 context={currentChatContext}
-                credentials={credentials}
+                credentials={{ ...credentials, authToken: authToken ?? undefined }}
                 hasCustomGeminiKey={Boolean(credentials.geminiApiKey.trim())}
                 onQuickApplyGeminiKey={handleQuickApplyGeminiKey}
                 onClearAttachedCode={() => setAttachedCode(undefined)}
@@ -1086,7 +1115,7 @@ export function WorkspacePage() {
                 onClearChat={() => setMessages([])}
                 onOpenCitation={(fp, s, e) => openCodeLocation(fp, s, e)}
                 onTraceCode={handleTraceCode}
-              />
+              />}
             </div>
           )}
 
@@ -1134,8 +1163,13 @@ export function WorkspacePage() {
             {explorationMode === 'diagrams' ? (
               <DiagramExplorerPanel
                 repositoryId={repository.id}
+                authToken={authToken}
+                filesMeta={filesMeta}
                 activeDiagramType={activeDiagramType}
-                onChangeDiagramType={setActiveDiagramType}
+                onChangeDiagramType={(type) => {
+                  setActiveDiagramType(type);
+                  setSelectedGraphNodeId(null);
+                }}
                 selectedGraphNodeId={selectedGraphNodeId}
                 onSelectGraphNode={handleSelectDiagramNode}
                 onOpenCodeLocation={openCodeLocation}

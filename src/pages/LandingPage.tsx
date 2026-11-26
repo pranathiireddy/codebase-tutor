@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowRight,
   ExternalLink,
@@ -30,7 +30,7 @@ const STAGE_STEPS: { stage: AnalysisStage; label: string }[] = [
 
 export function LandingPage() {
   const navigate = useNavigate();
-  const { credentials } = useApp();
+  const { credentials, authToken, user } = useApp();
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const [repoUrl, setRepoUrl] = useState('');
@@ -39,9 +39,11 @@ export function LandingPage() {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  const fetchRepositories = async () => {
+  const fetchRepositories = useCallback(async () => {
     try {
-      const res = await fetch('/api/repositories');
+      const res = await fetch('/api/repositories', {
+        headers: buildApiHeaders({ ...credentials, authToken: authToken ?? undefined }),
+      });
       if (res.ok) {
         const json = await safeJson<{ repositories: RepositoryRecord[] }>(res);
         setRepositories(json.repositories);
@@ -49,7 +51,7 @@ export function LandingPage() {
     } catch {
       // ignore transient error
     }
-  };
+  }, [credentials, authToken]);
 
   useEffect(() => {
     void fetchRepositories();
@@ -57,14 +59,16 @@ export function LandingPage() {
       void fetchRepositories();
     }, 1800);
     return () => clearInterval(timer);
-  }, []);
+  }, [fetchRepositories]);
 
   // Poll active import progress until ready or error
   useEffect(() => {
     if (!activeImport || activeImport.stage === 'ready' || activeImport.stage === 'error') return;
     const timer = setInterval(async () => {
       try {
-        const res = await fetch(`/api/repositories/${encodeURIComponent(activeImport.id)}/analysis`);
+        const res = await fetch(`/api/repositories/${encodeURIComponent(activeImport.id)}/analysis`, {
+          headers: buildApiHeaders({ ...credentials, authToken: authToken ?? undefined }),
+        });
         if (res.ok) {
           const json = await safeJson<{ repository: RepositoryRecord }>(res);
           setActiveImport(json.repository);
@@ -77,11 +81,15 @@ export function LandingPage() {
       }
     }, 900);
     return () => clearInterval(timer);
-  }, [activeImport, navigate]);
+  }, [activeImport, navigate, credentials, authToken]);
 
   const handleAnalyzeSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitError(null);
+    if (!user || !authToken) {
+      navigate('/login');
+      return;
+    }
     let trimmed = repoUrl.trim();
     if (!trimmed) {
       setSubmitError('Enter a GitHub URL such as https://github.com/DietrichGebert/ponytail');
@@ -99,7 +107,7 @@ export function LandingPage() {
     try {
       const res = await fetch('/api/repositories/analyze', {
         method: 'POST',
-        headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
+        headers: buildApiHeaders({ ...credentials, authToken: authToken ?? undefined }, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ url: trimmed }),
       });
       const json = await safeJson<{ repository?: RepositoryRecord; error?: string }>(res);
@@ -117,19 +125,12 @@ export function LandingPage() {
     }
   };
 
-  const handleExploreDemo = async (repo: RepositoryRecord) => {
-    if (repo.stage === 'ready') {
+  const handleExploreDemo = (repo: RepositoryRecord) => {
+    if (repo.stage === 'error') {
+      setSubmitError('The featured demo is currently unavailable. Please try again later.');
+    } else {
       navigate(`/workspace/${encodeURIComponent(repo.id)}`);
-      return;
     }
-    if (repo.stage === 'error' || repo.stage === 'queued') {
-      await fetch('/api/repositories/analyze', {
-        method: 'POST',
-        headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ url: repo.url, forceRefresh: repo.stage === 'error' }),
-      });
-    }
-    navigate(`/workspace/${encodeURIComponent(repo.id)}`);
   };
 
   const ponytail = repositories.find((r) => r.isFeaturedDemo);
@@ -163,7 +164,10 @@ export function LandingPage() {
             <div className="flex flex-wrap items-center gap-3 pt-1">
               <button
                 type="button"
-                onClick={() => inputRef.current?.focus()}
+                onClick={() => {
+                  if (user) inputRef.current?.focus();
+                  else navigate('/login');
+                }}
                 className="inline-flex items-center gap-2 rounded-md bg-sky-500 px-4 py-2.5 text-sm font-semibold text-[#0B0D10] hover:bg-sky-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <span>Explore a repository</span>
@@ -173,9 +177,9 @@ export function LandingPage() {
                 type="button"
                 onClick={() => {
                   if (ponytail) {
-                    void handleExploreDemo(ponytail);
+                    handleExploreDemo(ponytail);
                   } else {
-                    navigate('/workspace/dietrichgebert__ponytail');
+                    setSubmitError('The featured demo is currently unavailable. Please try again later.');
                   }
                 }}
                 className="inline-flex items-center gap-2 rounded-md border border-[#232832] bg-[#141820] px-4 py-2.5 text-sm font-medium text-[#E6E9EF] hover:border-[#3A4354] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
@@ -192,7 +196,11 @@ export function LandingPage() {
               <p className="mt-1 text-xs text-[#9CA3AF]">
                 Static analysis runs safely on the server without executing repository code.{' '}
                 <Link to="/settings" className="text-sky-400 hover:text-sky-300">
-                  {credentials.githubToken.trim() ? 'Using custom GitHub token' : 'Add GitHub token for private repos'}
+                  {user
+                    ? credentials.githubToken.trim()
+                      ? 'Using custom GitHub token'
+                      : 'Add GitHub token for private repos'
+                    : 'Log in to import repositories'}
                 </Link>
               </p>
             </div>
@@ -208,6 +216,7 @@ export function LandingPage() {
                   type="text"
                   value={repoUrl}
                   onChange={(e) => setRepoUrl(e.target.value)}
+                  disabled={!user}
                   placeholder={
                     credentials.githubDefaultOwner.trim()
                       ? `repo-name (defaults to ${credentials.githubDefaultOwner.trim()}/...) or full URL`
@@ -219,7 +228,7 @@ export function LandingPage() {
 
               <button
                 type="submit"
-                disabled={submitting}
+                disabled={submitting || !user}
                 className="flex w-full items-center justify-center gap-2 rounded-md bg-[#F3F4F6] px-4 py-2 text-xs font-semibold text-[#0B0D10] hover:bg-white disabled:opacity-50 transition-colors cursor-pointer"
               >
                 {submitting ? (
@@ -232,6 +241,15 @@ export function LandingPage() {
                 )}
               </button>
             </form>
+
+            {!user && (
+              <p className="text-xs text-[#9CA3AF]">
+                <Link to="/login" className="text-sky-400 hover:text-sky-300">
+                  Log in
+                </Link>{' '}
+                to analyze your own repositories.
+              </p>
+            )}
 
             {submitError && (
               <div className="flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-300">

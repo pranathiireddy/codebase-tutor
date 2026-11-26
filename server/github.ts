@@ -1,4 +1,5 @@
 import zlib from 'node:zlib';
+import { config } from './config.ts';
 
 export interface ParsedGitHubRepo {
   owner: string;
@@ -27,9 +28,9 @@ export interface IngestedFile {
   isBinary: boolean;
 }
 
-const MAX_ARCHIVE_BYTES = 25 * 1024 * 1024; // 25 MB archive limit
-const MAX_FILES = 2500;
-const MAX_TEXT_FILE_BYTES = 350 * 1024; // 350 KB per source file
+const MAX_ARCHIVE_BYTES = config.maxArchiveBytes;
+const MAX_FILES = config.maxRepositoryFiles;
+const MAX_TEXT_FILE_BYTES = config.maxTextFileBytes;
 
 const IGNORED_DIR_SEGMENTS = new Set([
   '.git',
@@ -116,7 +117,7 @@ function cleanTokenValue(raw?: string): string {
 }
 
 function resolveGithubToken(tokenOverride?: string): string {
-  return cleanTokenValue(tokenOverride) || cleanTokenValue(process.env.GITHUB_TOKEN);
+  return cleanTokenValue(tokenOverride) || cleanTokenValue(config.githubToken);
 }
 
 function githubHeaders(tokenOverride?: string): Record<string, string> {
@@ -143,7 +144,7 @@ export async function verifyGitHubToken(token: string): Promise<{ valid: boolean
 
   const res = await fetch('https://api.github.com/user', {
     headers,
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(config.githubAuthTimeoutMs),
   });
 
   const remaining = Number(res.headers.get('x-ratelimit-remaining') ?? '0');
@@ -157,7 +158,7 @@ export async function verifyGitHubToken(token: string): Promise<{ valid: boolean
   if (res.status === 403) {
     const rateRes = await fetch('https://api.github.com/rate_limit', {
       headers,
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(config.githubAuthTimeoutMs),
     });
     if (rateRes.ok) {
       const rateRem = Number(rateRes.headers.get('x-ratelimit-remaining') ?? remaining);
@@ -182,7 +183,7 @@ export async function fetchGitHubRepoMetadata(
   const apiUrl = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
   const res = await fetch(apiUrl, {
     headers: githubHeaders(cleanToken),
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(config.githubApiTimeoutMs),
   });
 
   if (res.status === 404) {
@@ -225,7 +226,7 @@ export async function fetchGitHubRepoMetadata(
   const commitUrl = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/commits/${encodeURIComponent(defaultBranch)}`;
   const commitRes = await fetch(commitUrl, {
     headers: githubHeaders(cleanToken),
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(config.githubApiTimeoutMs),
   });
 
   let commitSha = defaultBranch;
@@ -405,7 +406,7 @@ export async function downloadAndExtractGitHubRepo(
       'User-Agent': 'Codebase-Tutor-Analyzer/1.0',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    signal: AbortSignal.timeout(45000),
+    signal: AbortSignal.timeout(config.githubArchiveTimeoutMs),
   });
 
   if (!res.ok) {
@@ -414,12 +415,12 @@ export async function downloadAndExtractGitHubRepo(
 
   const contentLength = Number(res.headers.get('content-length') || '0');
   if (contentLength > MAX_ARCHIVE_BYTES) {
-    throw new Error('Repository archive exceeds 25 MB limit.');
+    throw new Error(`Repository archive exceeds ${Math.ceil(MAX_ARCHIVE_BYTES / (1024 * 1024))} MB limit.`);
   }
 
   const arrayBuffer = await res.arrayBuffer();
   if (arrayBuffer.byteLength > MAX_ARCHIVE_BYTES) {
-    throw new Error('Repository archive exceeds 25 MB limit.');
+    throw new Error(`Repository archive exceeds ${Math.ceil(MAX_ARCHIVE_BYTES / (1024 * 1024))} MB limit.`);
   }
 
   const compressed = Buffer.from(arrayBuffer);
