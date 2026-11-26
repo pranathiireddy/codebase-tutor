@@ -3,13 +3,15 @@ import { pathToFileURL } from 'node:url';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { createApp } from './server/app.ts';
+import { initializeAuth, SESSION_IDLE_TIMEOUT_MS } from './server/auth.ts';
 import { config } from './server/config.ts';
 import { initializeDatabase, removeExpiredSessions } from './server/db/index.ts';
 import { initializeFeaturedDemo, startPrivateAnalysisEviction } from './server/repoStore.ts';
 
 export async function startServer(): Promise<void> {
   initializeDatabase();
-  removeExpiredSessions();
+  await initializeAuth();
+  removeExpiredSessions(Date.now(), SESSION_IDLE_TIMEOUT_MS);
   initializeFeaturedDemo();
   startPrivateAnalysisEviction();
 

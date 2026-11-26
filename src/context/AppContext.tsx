@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
 import type { DiagramType, UserProfile } from '../types/codebase';
+import { apiFetch, safeJson } from '../utils/api';
 
 export interface WorkspacePreferences {
   editorFontSize: number;
@@ -23,9 +24,8 @@ export interface CredentialStatus {
 
 interface AppContextValue {
   user: UserProfile | null;
-  authToken: string | null;
   authLoading: boolean;
-  setSession: (user: UserProfile | null, token: string | null) => void;
+  setSession: (user: UserProfile | null) => void;
   logout: () => Promise<void>;
   preferences: WorkspacePreferences;
   updatePreferences: (partial: Partial<WorkspacePreferences>) => void;
@@ -37,7 +37,6 @@ interface AppContextValue {
 }
 
 const SESSION_CREDS_KEY = 'codebase_tutor_session_creds_v1';
-const SESSION_AUTH_KEY = 'codebase_tutor_auth_token_v1';
 
 const DEFAULT_CREDENTIALS: UserApiCredentials = {
   geminiApiKey: '',
@@ -83,7 +82,6 @@ const AppContext = createContext<AppContextValue | undefined>(undefined);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<UserProfile | null>(null);
-  const [authToken, setAuthToken] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [preferences, setPreferences] = useState<WorkspacePreferences>({
     editorFontSize: 13,
@@ -98,42 +96,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
-    let token: string | null = null;
-    try {
-      token = window.sessionStorage.getItem(SESSION_AUTH_KEY);
-    } catch {
-      setAuthLoading(false);
-      return;
-    }
-
-    if (!token) {
-      setAuthLoading(false);
-      return;
-    }
-
-    void fetch('/api/auth/me', { headers: { Authorization: `Bearer ${token}` } })
+    void apiFetch('/api/auth/me')
       .then(async (res) => {
-        if (!res.ok) throw new Error('Stored session is no longer valid.');
-        return (await res.json()) as { user?: UserProfile };
+        if (res.status === 401) {
+          if (!cancelled) {
+            setUser(null);
+            setCredentials(DEFAULT_CREDENTIALS);
+            saveSessionCredentials(DEFAULT_CREDENTIALS);
+            setCredentialStatus({ geminiVerified: null, githubVerified: null });
+          }
+          return { user: undefined };
+        }
+        return safeJson<{ user?: UserProfile }>(res);
       })
       .then((response) => {
         if (!cancelled && response.user) {
           setUser(response.user);
-          setAuthToken(token);
         }
       })
-      .catch(() => {
-        try {
-          window.sessionStorage.removeItem(SESSION_AUTH_KEY);
-        } catch {
-          // Session state remains cleared in memory.
-        }
-        if (!cancelled) {
-          setCredentials(DEFAULT_CREDENTIALS);
-          saveSessionCredentials(DEFAULT_CREDENTIALS);
-          setCredentialStatus({ geminiVerified: null, githubVerified: null });
-        }
-      })
+      .catch(() => undefined)
       .finally(() => {
         if (!cancelled) setAuthLoading(false);
       });
@@ -143,43 +124,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const setSession = useCallback((nextUser: UserProfile | null, nextToken: string | null) => {
+  const setSession = useCallback((nextUser: UserProfile | null) => {
     setUser(nextUser);
-    setAuthToken(nextToken);
     setAuthLoading(false);
     setCredentials(DEFAULT_CREDENTIALS);
     saveSessionCredentials(DEFAULT_CREDENTIALS);
     setCredentialStatus({ geminiVerified: null, githubVerified: null });
-    try {
-      if (nextToken) window.sessionStorage.setItem(SESSION_AUTH_KEY, nextToken);
-      else window.sessionStorage.removeItem(SESSION_AUTH_KEY);
-    } catch {
-      // The active session remains usable until this page is closed.
-    }
   }, []);
 
   const logout = useCallback(async () => {
-    if (authToken) {
-      try {
-        await fetch('/api/auth/logout', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
-      } catch {
-        // ignore network error on logout
-      }
+    try {
+      await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // Local state is cleared even if the server is unreachable.
     }
     setUser(null);
-    setAuthToken(null);
     setCredentials(DEFAULT_CREDENTIALS);
     saveSessionCredentials(DEFAULT_CREDENTIALS);
     setCredentialStatus({ geminiVerified: null, githubVerified: null });
-    try {
-      window.sessionStorage.removeItem(SESSION_AUTH_KEY);
-    } catch {
-      // Session state remains cleared in memory.
-    }
-  }, [authToken]);
+  }, []);
 
   const updatePreferences = useCallback((partial: Partial<WorkspacePreferences>) => {
     setPreferences((prev) => ({ ...prev, ...partial }));
@@ -203,7 +166,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     <AppContext.Provider
       value={{
         user,
-        authToken,
         authLoading,
         setSession,
         logout,

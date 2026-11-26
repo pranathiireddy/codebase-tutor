@@ -35,12 +35,11 @@ import type {
   DiagramVisualNode,
   ExtractedSymbol,
 } from '../types/codebase';
-import { buildApiHeaders, safeJson } from '../utils/api';
+import { apiFetch, safeJson } from '../utils/api';
 import { MermaidDiagram } from './MermaidDiagram';
 
 interface DiagramExplorerPanelProps {
   repositoryId: string;
-  authToken?: string | null;
   filesMeta: AnalyzedFileMeta[];
   activeDiagramType: DiagramType;
   onChangeDiagramType: (type: DiagramType) => void;
@@ -378,7 +377,6 @@ function ConfidenceLabel({ level }: { level: 'verified' | 'inferred' | 'uncertai
 
 export function DiagramExplorerPanel({
   repositoryId,
-  authToken,
   filesMeta,
   activeDiagramType,
   onChangeDiagramType,
@@ -495,9 +493,7 @@ export function DiagramExplorerPanel({
       setExpandedNodeDetails(null);
       setActiveScenarioIdx(0);
       try {
-        const res = await fetch(`/api/repositories/${encodeURIComponent(repositoryId)}/diagrams/${activeDiagramType}`, {
-          headers: buildApiHeaders({ authToken: authToken ?? undefined }),
-        });
+        const res = await apiFetch(`/api/repositories/${encodeURIComponent(repositoryId)}/diagrams/${activeDiagramType}`);
         const json = await safeJson<{ diagram?: DiagramPayload; error?: string }>(res);
         if (!res.ok || !json.diagram) {
           throw new Error(json.error || 'Failed to load diagram.');
@@ -517,7 +513,7 @@ export function DiagramExplorerPanel({
     return () => {
       cancelled = true;
     };
-  }, [repositoryId, activeDiagramType, authToken]);
+  }, [repositoryId, activeDiagramType]);
 
   useEffect(() => {
     if (!diagram) return;
@@ -533,9 +529,8 @@ export function DiagramExplorerPanel({
     onSelectGraphNode(visualNode);
 
     try {
-      const res = await fetch(
+      const res = await apiFetch(
         `/api/repositories/${encodeURIComponent(repositoryId)}/diagrams/${activeDiagramType}/nodes/${encodeURIComponent(visualNode.id)}`,
-        { headers: buildApiHeaders({ authToken: authToken ?? undefined }) }
       );
       if (res.ok) {
         const details = await safeJson<{

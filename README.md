@@ -23,7 +23,7 @@ npm run dev
 
 The Express server listens on port 3000 and serves the Vite app through middleware. The featured repository is prepared in the background when the server starts.
 
-Guests can browse the featured demo read-only. Sign in to analyze personal repositories, use tutor chat, or manage API keys. Gemini and GitHub requests are made by the server; browser-side provider fallbacks are disabled. User accounts and expiring sessions are stored in SQLite, while custom provider credentials remain in the active browser tab session.
+Guests can browse the featured demo read-only. Sign in to analyze personal repositories, use tutor chat, or manage API keys. Gemini and GitHub requests are made by the server; browser-side provider fallbacks are disabled. User accounts and sessions are stored in SQLite. Sessions use an HttpOnly, SameSite=Lax cookie, expire after 30 minutes idle or 7 days, and are protected by CSRF tokens. Custom provider credentials remain in the active browser tab session.
 
 ## Test and lint
 

@@ -15,7 +15,7 @@ import {
 import { TopNav } from '../components/TopNav';
 import { useApp } from '../context/AppContext';
 import type { DiagramType } from '../types/codebase';
-import { buildApiHeaders, safeJson } from '../utils/api';
+import { apiFetch, safeJson } from '../utils/api';
 
 interface ServerKeyStatus {
   hasServerGeminiKey: boolean;
@@ -53,7 +53,6 @@ export function SettingsPage() {
     preferences,
     updatePreferences,
     user,
-    authToken,
     credentials,
     updateCredentials,
     clearCredentials,
@@ -88,9 +87,7 @@ export function SettingsPage() {
     let cancelled = false;
     async function loadServerStatus() {
       try {
-        const res = await fetch('/api/settings/status', {
-          headers: buildApiHeaders({ authToken: authToken ?? undefined }),
-        });
+        const res = await apiFetch('/api/settings/status');
         if (res.ok && !cancelled) {
           const data = await safeJson<ServerKeyStatus>(res);
           setServerStatus(data);
@@ -148,9 +145,9 @@ export function SettingsPage() {
     setVerifying(true);
     try {
       let json: VerifyResponse & { error?: string };
-      const res = await fetch('/api/settings/verify', {
+      const res = await apiFetch('/api/settings/verify', {
         method: 'POST',
-        headers: buildApiHeaders({ authToken: authToken ?? undefined }, { 'Content-Type': 'application/json' }),
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           geminiApiKey: trimmedGemini || undefined,
           geminiModel: effectiveModel,
@@ -211,9 +208,8 @@ export function SettingsPage() {
     setClearing(true);
     setCacheMessage(null);
     try {
-      const res = await fetch('/api/cache/clear', {
+      const res = await apiFetch('/api/cache/clear', {
         method: 'POST',
-        headers: buildApiHeaders({ authToken: authToken ?? undefined }),
       });
       const json = await safeJson<{ cleared?: number }>(res);
       setCacheMessage(`Cleared ${json.cleared ?? 0} cached commit snapshot(s).`);

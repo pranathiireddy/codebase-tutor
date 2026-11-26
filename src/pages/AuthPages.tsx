@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { TopNav } from '../components/TopNav';
 import { useApp } from '../context/AppContext';
-import { safeJson } from '../utils/api';
+import { apiFetch, safeJson } from '../utils/api';
 import type { UserProfile } from '../types/codebase';
 
 export function LoginPage() {
@@ -18,16 +18,16 @@ export function LoginPage() {
     setError(null);
     setLoading(true);
     try {
-      const res = await fetch('/api/auth/login', {
+      const res = await apiFetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
-      const json = await safeJson<{ token?: string; user?: UserProfile; error?: string }>(res);
-      if (!res.ok || !json.token || !json.user) {
+      const json = await safeJson<{ user?: UserProfile; error?: string }>(res);
+      if (!res.ok || !json.user) {
         throw new Error(json.error || 'Sign in failed.');
       }
-      setSession(json.user, json.token);
+      setSession(json.user);
       navigate('/workspace/dietrichgebert__ponytail');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to sign in.');
@@ -121,16 +121,16 @@ export function SignupPage() {
     setError(null);
     setLoading(true);
     try {
-      const res = await fetch('/api/auth/signup', {
+      const res = await apiFetch('/api/auth/signup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, email, role, password }),
       });
-      const json = await safeJson<{ token?: string; user?: UserProfile; error?: string }>(res);
-      if (!res.ok || !json.token || !json.user) {
+      const json = await safeJson<{ user?: UserProfile; error?: string }>(res);
+      if (!res.ok || !json.user) {
         throw new Error(json.error || 'Registration failed.');
       }
-      setSession(json.user, json.token);
+      setSession(json.user);
       navigate('/workspace/dietrichgebert__ponytail');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to create account.');
@@ -201,13 +201,13 @@ export function SignupPage() {
 
             <div className="space-y-1.5">
               <label htmlFor="signup-password" className="block text-xs font-medium text-[#D1D5DB]">
-                Password (min 6 characters)
+                Password (min 12 characters)
               </label>
               <input
                 id="signup-password"
                 type="password"
                 required
-                minLength={6}
+                minLength={12}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••"

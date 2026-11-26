@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
+import cookieParser from 'cookie-parser';
 import {
   clearRepositoryCache,
   getAnalyzedRepo,
@@ -19,28 +20,43 @@ import { config } from './config.ts';
 import {
   consumeGeminiDailyQuota,
   createSession,
-  deleteSession,
+  changePasswordAndRotateSession,
+  clearFailedLogins,
   findUserByEmail,
-  getSessionUser,
+  findUserById,
   insertUser,
-  type StoredUser,
+  listActiveSessions,
+  recordAuditEvent,
+  recordFailedLogin,
+  revokeAllSessions,
+  revokeSession,
 } from './db/index.ts';
+import {
+  clearSessionCookie,
+  createSessionCredentials,
+  csrfProtection,
+  currentSessionIdHash,
+  getAuthContext,
+  hashPassword,
+  LOGIN_LOCK_DURATION_MS,
+  LOGIN_LOCK_THRESHOLD,
+  loginAccountRateLimiter,
+  loginIpRateLimiter,
+  optionalAuth,
+  requireAuth,
+  setSessionCookie,
+  SESSION_IDLE_TIMEOUT_MS,
+  signupRateLimiter,
+  validatePassword,
+  verifyDummyPassword,
+  verifyPassword,
+} from './auth.ts';
 import type { ChatContext, DiagramType, UserProfile } from '../src/types/codebase.ts';
-
-function hashPassword(password: string, salt: string): string {
-  return crypto.scryptSync(password, salt, 64).toString('hex');
-}
-
-function verifyPassword(password: string, salt: string, expectedHex: string): boolean {
-  const actual = Buffer.from(hashPassword(password, salt), 'hex');
-  const expected = Buffer.from(expectedHex, 'hex');
-  if (actual.length !== expected.length) return false;
-  return crypto.timingSafeEqual(actual, expected);
-}
 
 export function createApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: config.jsonBodyLimitBytes }));
+  app.use(cookieParser());
   app.use((req: Request, res: Response, next: NextFunction) => {
     const origin = req.get('Origin');
     if (!origin) {
@@ -58,10 +74,11 @@ export function createApp(): express.Express {
 
     res.vary('Origin');
     res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Authorization, Content-Type, X-Gemini-Api-Key, X-Gemini-Model, X-Github-Token'
+      'Content-Type, X-Csrf-Token, X-Gemini-Api-Key, X-Gemini-Model, X-Github-Token'
     );
     if (req.method === 'OPTIONS') {
       res.sendStatus(204);
@@ -69,20 +86,27 @@ export function createApp(): express.Express {
     }
     next();
   });
+  app.use(csrfProtection);
 
-  function getRequestUser(req: Request): UserProfile | undefined {
-    const auth = req.headers.authorization ?? '';
-    const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-    return token ? getSessionUser(token) : undefined;
+  function getRequestUser(res: Response): UserProfile | undefined {
+    return getAuthContext(res)?.user;
   }
 
-  function requireUser(req: Request, res: Response): UserProfile | undefined {
-    const user = getRequestUser(req);
-    if (!user) {
-      res.status(401).json({ error: 'Sign in is required for this feature.' });
-      return undefined;
-    }
-    return user;
+  function audit(
+    req: Request,
+    event: string,
+    userId?: string | null,
+    detail?: Record<string, unknown>
+  ): void {
+    recordAuditEvent({
+      id: crypto.randomUUID(),
+      userId,
+      event,
+      ip: req.ip || null,
+      userAgent: req.get('User-Agent') ?? null,
+      createdAt: Date.now(),
+      detail,
+    });
   }
 
   function reserveServerKeyRequest(userId: string, apiKeyOverride?: string): boolean {
@@ -97,72 +121,187 @@ app.get('/api/health', (_req: Request, res: Response) => {
 });
 
 // Auth routes
-app.post('/api/auth/signup', (req: Request, res: Response) => {
-  const { name, email, password, role } = req.body as {
-    name?: string;
-    email?: string;
-    password?: string;
-    role?: string;
+app.get('/api/auth/csrf', (req: Request, res: Response) => {
+  res.json({ csrfToken: res.locals.csrfToken ?? req.cookies?.codebase_tutor_csrf });
+});
+
+app.post('/api/auth/signup', signupRateLimiter(), async (req: Request, res: Response) => {
+  const { name, email, password, role } = (req.body ?? {}) as {
+    name?: unknown;
+    email?: unknown;
+    password?: unknown;
+    role?: unknown;
   };
-  const cleanEmail = (email ?? '').trim().toLowerCase();
-  const cleanName = (name ?? '').trim();
-  if (!cleanName || !cleanEmail || !password || password.length < 6) {
-    res.status(400).json({ error: 'Name, valid email, and a password of at least 6 characters are required.' });
+  const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  const cleanName = typeof name === 'string' ? name.trim() : '';
+  if (
+    !cleanName ||
+    cleanName.length > 120 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail) ||
+    typeof password !== 'string'
+  ) {
+    res.status(400).json({ error: 'Enter a name and a valid email address.' });
     return;
   }
-  const salt = crypto.randomBytes(16).toString('hex');
-  const user: StoredUser = {
+  const passwordError = validatePassword(password, cleanEmail, cleanName);
+  if (passwordError) {
+    res.status(400).json({ error: passwordError });
+    return;
+  }
+
+  const user: UserProfile & { passwordHash: string } = {
     id: crypto.randomUUID(),
     name: cleanName,
     email: cleanEmail,
-    role: (role ?? 'Student / Developer').trim(),
-    salt,
-    passwordHash: hashPassword(password, salt),
+    role: typeof role === 'string' && role.trim() ? role.trim() : 'Student / Developer',
+    passwordHash: await hashPassword(password),
   };
   if (!insertUser(user)) {
     res.status(409).json({ error: 'An account with that email already exists.' });
     return;
   }
 
-  const token = crypto.randomBytes(config.sessionTokenBytes).toString('hex');
-  const profile: UserProfile = { id: user.id, name: user.name, email: user.email, role: user.role };
-  createSession(token, user.id, Date.now() + config.sessionTtlMs);
-  res.status(201).json({ token, user: profile });
+  const { token, session } = createSessionCredentials(user.id, req);
+  createSession(session);
+  setSessionCookie(res, token);
+  audit(req, 'signup', user.id);
+  const { passwordHash: _passwordHash, ...profile } = user;
+  res.status(201).json({ user: profile });
 });
 
-app.post('/api/auth/login', (req: Request, res: Response) => {
-  const { email, password } = req.body as { email?: string; password?: string };
-  const cleanEmail = (email ?? '').trim().toLowerCase();
-  const user = findUserByEmail(cleanEmail);
-  if (!user || !password || !verifyPassword(password, user.salt, user.passwordHash)) {
-    res.status(401).json({ error: 'Invalid email or password.' });
+const loginIpLimiter = loginIpRateLimiter();
+const loginAccountLimiter = loginAccountRateLimiter();
+app.post(
+  '/api/auth/login',
+  loginIpLimiter,
+  loginAccountLimiter,
+  async (req: Request, res: Response) => {
+    const { email, password } = (req.body ?? {}) as { email?: unknown; password?: unknown };
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail) || typeof password !== 'string' || !password) {
+      res.status(400).json({ error: 'Enter a valid email address and password.' });
+      return;
+    }
+
+    const now = Date.now();
+    const user = findUserByEmail(cleanEmail);
+    if (!user) {
+      await verifyDummyPassword(password);
+      audit(req, 'login_failure', null, { reason: 'invalid_credentials' });
+      res.status(401).json({ error: 'Invalid email or password.' });
+      return;
+    }
+    if (user.lockedUntil !== null && user.lockedUntil > now) {
+      await verifyDummyPassword(password);
+      audit(req, 'login_failure', user.id, { reason: 'invalid_credentials' });
+      res.status(401).json({ error: 'Invalid email or password.' });
+      return;
+    }
+
+    if (!(await verifyPassword(user.passwordHash, password))) {
+      const failure = recordFailedLogin(user.id, now, LOGIN_LOCK_THRESHOLD, LOGIN_LOCK_DURATION_MS);
+      audit(req, 'login_failure', user.id, { reason: 'invalid_credentials' });
+      if (failure.lockedUntil !== null && failure.failedLogins === LOGIN_LOCK_THRESHOLD) {
+        audit(req, 'lockout', user.id, { durationMs: LOGIN_LOCK_DURATION_MS });
+      }
+      res.status(401).json({ error: 'Invalid email or password.' });
+      return;
+    }
+
+    clearFailedLogins(user.id, now);
+    const { token, session } = createSessionCredentials(user.id, req, now);
+    createSession(session);
+    setSessionCookie(res, token);
+    audit(req, 'login_success', user.id);
+    res.json({
+      user: { id: user.id, email: user.email, name: user.name, role: user.role },
+    });
+  }
+);
+
+app.get('/api/auth/me', requireAuth, (_req: Request, res: Response) => {
+  res.json({ user: getRequestUser(res) });
+});
+
+app.post('/api/auth/change-password', requireAuth, async (req: Request, res: Response) => {
+  const auth = getAuthContext(res)!;
+  const body = (req.body ?? {}) as {
+    currentPassword?: unknown;
+    newPassword?: unknown;
+  };
+  if (typeof body.currentPassword !== 'string' || typeof body.newPassword !== 'string') {
+    res.status(400).json({ error: 'Enter your current password and a new password.' });
     return;
   }
-  const token = crypto.randomBytes(config.sessionTokenBytes).toString('hex');
-  const profile: UserProfile = { id: user.id, name: user.name, email: user.email, role: user.role };
-  createSession(token, user.id, Date.now() + config.sessionTtlMs);
-  res.json({ token, user: profile });
-});
-
-app.get('/api/auth/me', (req: Request, res: Response) => {
-  const user = getRequestUser(req);
-  if (!user) {
-    res.status(401).json({ error: 'Not signed in.' });
+  const user = findUserById(auth.user.id);
+  if (!user || !(await verifyPassword(user.passwordHash, body.currentPassword))) {
+    res.status(400).json({ error: 'Current password is incorrect.' });
     return;
   }
-  res.json({ user });
+  const passwordError = validatePassword(body.newPassword, user.email, user.name);
+  if (passwordError) {
+    res.status(400).json({ error: passwordError });
+    return;
+  }
+
+  const { token, session } = createSessionCredentials(user.id, req);
+  if (!changePasswordAndRotateSession(user.id, await hashPassword(body.newPassword), session)) {
+    res.status(404).json({ error: 'Account not found.' });
+    return;
+  }
+  setSessionCookie(res, token);
+  audit(req, 'password_change', user.id);
+  res.json({ ok: true });
 });
 
-app.post('/api/auth/logout', (req: Request, res: Response) => {
-  const auth = req.headers.authorization ?? '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  if (token) deleteSession(token);
+app.get('/api/auth/sessions', requireAuth, (_req: Request, res: Response) => {
+  const auth = getAuthContext(res)!;
+  const sessions = listActiveSessions(auth.user.id, Date.now(), SESSION_IDLE_TIMEOUT_MS);
+  res.json({
+    sessions: sessions.map((session) => ({
+      ...session,
+      current: session.idHash === auth.session.idHash,
+    })),
+  });
+});
+
+app.delete('/api/auth/sessions/:sessionId', requireAuth, (req: Request, res: Response) => {
+  const auth = getAuthContext(res)!;
+  const sessionId = String(req.params.sessionId);
+  if (!/^[a-f0-9]{64}$/i.test(sessionId)) {
+    res.status(400).json({ error: 'Invalid session identifier.' });
+    return;
+  }
+  if (!revokeSession(sessionId, auth.user.id, Date.now())) {
+    res.status(404).json({ error: 'Session not found.' });
+    return;
+  }
+  if (sessionId === auth.session.idHash) clearSessionCookie(res);
+  audit(req, 'session_revoked', auth.user.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/logout-everywhere', requireAuth, (req: Request, res: Response) => {
+  const auth = getAuthContext(res)!;
+  revokeAllSessions(auth.user.id, Date.now());
+  clearSessionCookie(res);
+  audit(req, 'logout_everywhere', auth.user.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/logout', optionalAuth, (req: Request, res: Response) => {
+  const auth = getAuthContext(res);
+  if (auth) {
+    revokeSession(auth.session.idHash, auth.user.id, Date.now());
+    audit(req, 'logout', auth.user.id);
+  }
+  clearSessionCookie(res);
   res.json({ ok: true });
 });
 
 // Repositories API
-app.get('/api/repositories', (req: Request, res: Response) => {
-  const user = getRequestUser(req);
+app.get('/api/repositories', optionalAuth, (_req: Request, res: Response) => {
+  const user = getRequestUser(res);
   res.json({
     repositories: listRepositories(user?.id),
     featuredDemoUrl: PONYTAIL_REPO_URL,
@@ -170,8 +309,7 @@ app.get('/api/repositories', (req: Request, res: Response) => {
 });
 
 // Settings status & credential verification (never returns server secrets)
-app.get('/api/settings/status', (req: Request, res: Response) => {
-  if (!requireUser(req, res)) return;
+app.get('/api/settings/status', requireAuth, (_req: Request, res: Response) => {
   const geminiKey = config.geminiApiKey ?? '';
   const githubTok = config.githubToken ?? '';
   res.json({
@@ -182,8 +320,7 @@ app.get('/api/settings/status', (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/settings/verify', async (req: Request, res: Response) => {
-  if (!requireUser(req, res)) return;
+app.post('/api/settings/verify', requireAuth, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as {
     geminiApiKey?: string;
     geminiModel?: string;
@@ -208,9 +345,8 @@ app.post('/api/settings/verify', async (req: Request, res: Response) => {
   res.json(result);
 });
 
-app.post('/api/repositories/analyze', async (req: Request, res: Response) => {
-  const user = requireUser(req, res);
-  if (!user) return;
+app.post('/api/repositories/analyze', requireAuth, async (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
   const { url, forceRefresh } = req.body as { url?: string; forceRefresh?: boolean };
   const githubToken = req.header('x-github-token')?.trim() || undefined;
   if (!url || typeof url !== 'string') {
@@ -231,9 +367,9 @@ app.post('/api/repositories/analyze', async (req: Request, res: Response) => {
   }
 });
 
-app.get('/api/repositories/:id/analysis', (req: Request, res: Response) => {
+app.get('/api/repositories/:id/analysis', optionalAuth, (req: Request, res: Response) => {
   const id = String(req.params.id);
-  const user = getRequestUser(req);
+  const user = getRequestUser(res);
   const record = getRepositoryRecord(id, user?.id);
   if (!record) {
     res.status(404).json({ error: 'Repository not found. Please import it first.' });
@@ -242,9 +378,9 @@ app.get('/api/repositories/:id/analysis', (req: Request, res: Response) => {
   res.json({ repository: record });
 });
 
-app.get('/api/repositories/:id/files', (req: Request, res: Response) => {
+app.get('/api/repositories/:id/files', optionalAuth, (req: Request, res: Response) => {
   const id = String(req.params.id);
-  const user = getRequestUser(req);
+  const user = getRequestUser(res);
   const data = getAnalyzedRepo(id, user?.id);
   if (!data) {
     res.status(404).json({ error: 'Repository analysis is not ready yet.' });
@@ -256,10 +392,10 @@ app.get('/api/repositories/:id/files', (req: Request, res: Response) => {
   });
 });
 
-app.get('/api/repositories/:id/files/content', (req: Request, res: Response) => {
+app.get('/api/repositories/:id/files/content', optionalAuth, (req: Request, res: Response) => {
   const id = String(req.params.id);
   const filePath = String(req.query.path ?? '');
-  const user = getRequestUser(req);
+  const user = getRequestUser(res);
   const data = getAnalyzedRepo(id, user?.id);
   if (!data) {
     res.status(404).json({ error: 'Repository analysis is not ready yet.' });
@@ -300,11 +436,11 @@ app.get('/api/repositories/:id/files/content', (req: Request, res: Response) => 
   });
 });
 
-app.get('/api/repositories/:id/trace', (req: Request, res: Response) => {
+app.get('/api/repositories/:id/trace', optionalAuth, (req: Request, res: Response) => {
   const id = String(req.params.id);
   const rawQuery = String(req.query.q ?? '').trim();
   const preferredFile = String(req.query.preferredFile ?? '').trim();
-  const user = getRequestUser(req);
+  const user = getRequestUser(res);
   const data = getAnalyzedRepo(id, user?.id);
   if (!data) {
     res.status(404).json({ error: 'Repository analysis is not ready yet.' });
@@ -417,9 +553,9 @@ app.get('/api/repositories/:id/trace', (req: Request, res: Response) => {
   });
 });
 
-app.get('/api/repositories/:id/graph', (req: Request, res: Response) => {
+app.get('/api/repositories/:id/graph', optionalAuth, (req: Request, res: Response) => {
   const id = String(req.params.id);
-  const user = getRequestUser(req);
+  const user = getRequestUser(res);
   const data = getAnalyzedRepo(id, user?.id);
   if (!data) {
     res.status(404).json({ error: 'Repository analysis is not ready yet.' });
@@ -428,9 +564,9 @@ app.get('/api/repositories/:id/graph', (req: Request, res: Response) => {
   res.json({ graph: data.graph });
 });
 
-app.get('/api/repositories/:id/diagrams', (req: Request, res: Response) => {
+app.get('/api/repositories/:id/diagrams', optionalAuth, (req: Request, res: Response) => {
   const id = String(req.params.id);
-  const user = getRequestUser(req);
+  const user = getRequestUser(res);
   const data = getAnalyzedRepo(id, user?.id);
   if (!data) {
     res.status(404).json({ error: 'Repository analysis is not ready yet.' });
@@ -450,10 +586,10 @@ app.get('/api/repositories/:id/diagrams', (req: Request, res: Response) => {
   res.json({ diagrams: list });
 });
 
-app.get('/api/repositories/:id/diagrams/:type', (req: Request, res: Response) => {
+app.get('/api/repositories/:id/diagrams/:type', optionalAuth, (req: Request, res: Response) => {
   const id = String(req.params.id);
   const type = String(req.params.type) as DiagramType;
-  const user = getRequestUser(req);
+  const user = getRequestUser(res);
   const data = getAnalyzedRepo(id, user?.id);
   if (!data) {
     res.status(404).json({ error: 'Repository analysis is not ready yet.' });
@@ -467,11 +603,11 @@ app.get('/api/repositories/:id/diagrams/:type', (req: Request, res: Response) =>
   res.json({ diagram });
 });
 
-app.get('/api/repositories/:id/diagrams/:type/nodes/:nodeId', (req: Request, res: Response) => {
+app.get('/api/repositories/:id/diagrams/:type/nodes/:nodeId', optionalAuth, (req: Request, res: Response) => {
   const id = String(req.params.id);
   const type = String(req.params.type) as DiagramType;
   const nodeId = decodeURIComponent(String(req.params.nodeId));
-  const user = getRequestUser(req);
+  const user = getRequestUser(res);
   const data = getAnalyzedRepo(id, user?.id);
   if (!data) {
     res.status(404).json({ error: 'Repository analysis is not ready yet.' });
@@ -498,9 +634,8 @@ app.get('/api/repositories/:id/diagrams/:type/nodes/:nodeId', (req: Request, res
   });
 });
 
-app.post('/api/repositories/:id/chat', async (req: Request, res: Response) => {
-  const user = requireUser(req, res);
-  if (!user) return;
+app.post('/api/repositories/:id/chat', requireAuth, async (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
   const id = String(req.params.id);
   const { question, context, history } = req.body as {
     question?: string;
@@ -542,9 +677,8 @@ app.post('/api/repositories/:id/chat', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/tts', async (req: Request, res: Response) => {
-  const user = requireUser(req, res);
-  if (!user) return;
+app.post('/api/tts', requireAuth, async (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
   const { text } = req.body as { text?: string };
   if (!text || typeof text !== 'string' || !text.trim()) {
     res.status(400).json({ error: 'Text is required for speech synthesis.' });
@@ -566,9 +700,8 @@ app.post('/api/tts', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/cache/clear', (req: Request, res: Response) => {
-  const user = requireUser(req, res);
-  if (!user) return;
+app.post('/api/cache/clear', requireAuth, (_req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
   const cleared = clearRepositoryCache(user.id);
   res.json({ cleared });
 });

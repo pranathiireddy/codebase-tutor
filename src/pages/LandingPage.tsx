@@ -14,7 +14,7 @@ import {
 import { Link, useNavigate } from 'react-router-dom';
 import { TopNav } from '../components/TopNav';
 import { useApp } from '../context/AppContext';
-import { buildApiHeaders, safeJson } from '../utils/api';
+import { apiFetch, buildApiHeaders, safeJson } from '../utils/api';
 import type { AnalysisStage, RepositoryRecord } from '../types/codebase';
 
 const STAGE_STEPS: { stage: AnalysisStage; label: string }[] = [
@@ -30,7 +30,7 @@ const STAGE_STEPS: { stage: AnalysisStage; label: string }[] = [
 
 export function LandingPage() {
   const navigate = useNavigate();
-  const { credentials, authToken, user } = useApp();
+  const { credentials, user } = useApp();
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const [repoUrl, setRepoUrl] = useState('');
@@ -41,9 +41,7 @@ export function LandingPage() {
 
   const fetchRepositories = useCallback(async () => {
     try {
-      const res = await fetch('/api/repositories', {
-        headers: buildApiHeaders({ ...credentials, authToken: authToken ?? undefined }),
-      });
+      const res = await apiFetch('/api/repositories');
       if (res.ok) {
         const json = await safeJson<{ repositories: RepositoryRecord[] }>(res);
         setRepositories(json.repositories);
@@ -51,7 +49,7 @@ export function LandingPage() {
     } catch {
       // ignore transient error
     }
-  }, [credentials, authToken]);
+  }, []);
 
   useEffect(() => {
     void fetchRepositories();
@@ -66,9 +64,7 @@ export function LandingPage() {
     if (!activeImport || activeImport.stage === 'ready' || activeImport.stage === 'error') return;
     const timer = setInterval(async () => {
       try {
-        const res = await fetch(`/api/repositories/${encodeURIComponent(activeImport.id)}/analysis`, {
-          headers: buildApiHeaders({ ...credentials, authToken: authToken ?? undefined }),
-        });
+        const res = await apiFetch(`/api/repositories/${encodeURIComponent(activeImport.id)}/analysis`);
         if (res.ok) {
           const json = await safeJson<{ repository: RepositoryRecord }>(res);
           setActiveImport(json.repository);
@@ -81,12 +77,12 @@ export function LandingPage() {
       }
     }, 900);
     return () => clearInterval(timer);
-  }, [activeImport, navigate, credentials, authToken]);
+  }, [activeImport, navigate]);
 
   const handleAnalyzeSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitError(null);
-    if (!user || !authToken) {
+    if (!user) {
       navigate('/login');
       return;
     }
@@ -105,9 +101,9 @@ export function LandingPage() {
 
     setSubmitting(true);
     try {
-      const res = await fetch('/api/repositories/analyze', {
+      const res = await apiFetch('/api/repositories/analyze', {
         method: 'POST',
-        headers: buildApiHeaders({ ...credentials, authToken: authToken ?? undefined }, { 'Content-Type': 'application/json' }),
+        headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ url: trimmed }),
       });
       const json = await safeJson<{ repository?: RepositoryRecord; error?: string }>(res);

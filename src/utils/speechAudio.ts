@@ -1,4 +1,4 @@
-import { buildApiHeaders, safeJson, type ApiCredentialHeaders } from './api';
+import { apiFetch, buildApiHeaders, safeJson, type ApiCredentialHeaders } from './api';
 
 export type VoiceEngineMode = 'lite' | 'browser';
 
@@ -199,7 +199,7 @@ export async function synthesizeAndPlayAnswer(options: {
   onLoading();
 
   try {
-    const res = await fetch('/api/tts', {
+    const res = await apiFetch('/api/tts', {
       method: 'POST',
       headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
       body: JSON.stringify({ text: spokenDigest }),

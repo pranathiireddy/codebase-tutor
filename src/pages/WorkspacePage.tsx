@@ -21,7 +21,7 @@ import { SourceCodePanel } from '../components/SourceCodePanel';
 import { DiagramExplorerPanel } from '../components/DiagramExplorerPanel';
 import { OverviewWalkthroughPanel } from '../components/OverviewWalkthroughPanel';
 import { useApp } from '../context/AppContext';
-import { buildApiHeaders, safeJson } from '../utils/api';
+import { apiFetch as apiRequest, buildApiHeaders, safeJson } from '../utils/api';
 import type {
   AnalyzedFileMeta,
   ChatCitation,
@@ -44,18 +44,15 @@ type ExplorationMode = 'overview' | 'code' | 'diagrams';
 export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
   const { repositoryId } = useParams<{ repositoryId?: string }>();
   const navigate = useNavigate();
-  const { preferences, credentials, authToken, updateCredentials, setCredentialStatus } = useApp();
-  const apiCredentials = useMemo(
-    () => ({ ...credentials, authToken: authToken ?? undefined }),
-    [credentials, authToken]
-  );
+  const { preferences, credentials, updateCredentials, setCredentialStatus } = useApp();
+  const apiCredentials = useMemo(() => credentials, [credentials]);
   const apiFetch = useCallback(
     (input: RequestInfo | URL, init?: RequestInit) => {
       const headers = new Headers(init?.headers);
       for (const [name, value] of Object.entries(buildApiHeaders(apiCredentials))) {
         headers.set(name, value);
       }
-      return fetch(input, { ...init, headers });
+      return apiRequest(input, { ...init, headers });
     },
     [apiCredentials]
   );
@@ -677,10 +674,10 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
           error?: string;
         };
 
-        const res = await fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/chat`, {
+        const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/chat`, {
           method: 'POST',
           headers: buildApiHeaders(
-            { ...credsToUse, authToken: authToken ?? undefined },
+            credsToUse,
             { 'Content-Type': 'application/json' }
           ),
           body: JSON.stringify({
@@ -744,7 +741,6 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
       targetRepoId,
       explorationMode,
       credentials,
-      authToken,
       updateCredentials,
       readOnly,
       navigate,
@@ -1106,7 +1102,7 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
                 messages={messages}
                 loading={chatLoading}
                 context={currentChatContext}
-                credentials={{ ...credentials, authToken: authToken ?? undefined }}
+                credentials={credentials}
                 hasCustomGeminiKey={Boolean(credentials.geminiApiKey.trim())}
                 onQuickApplyGeminiKey={handleQuickApplyGeminiKey}
                 onClearAttachedCode={() => setAttachedCode(undefined)}
@@ -1163,7 +1159,6 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
             {explorationMode === 'diagrams' ? (
               <DiagramExplorerPanel
                 repositoryId={repository.id}
-                authToken={authToken}
                 filesMeta={filesMeta}
                 activeDiagramType={activeDiagramType}
                 onChangeDiagramType={(type) => {

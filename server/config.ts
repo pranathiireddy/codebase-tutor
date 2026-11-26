@@ -16,8 +16,6 @@ const configSchema = z.object({
   GITHUB_AUTH_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   GITHUB_API_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
   GITHUB_ARCHIVE_TIMEOUT_MS: z.coerce.number().int().positive().default(45000),
-  SESSION_TTL_MS: z.coerce.number().int().positive().default(24 * 60 * 60 * 1000),
-  SESSION_TOKEN_BYTES: z.coerce.number().int().min(32).max(128).default(32),
   ALLOW_SERVER_KEY: booleanFromEnv,
   SERVER_KEY_DAILY_CAP: z.coerce.number().int().positive().default(50),
   APP_ENCRYPTION_KEY: z.preprocess(
@@ -73,8 +71,6 @@ export const config = Object.freeze({
   githubAuthTimeoutMs: env.GITHUB_AUTH_TIMEOUT_MS,
   githubApiTimeoutMs: env.GITHUB_API_TIMEOUT_MS,
   githubArchiveTimeoutMs: env.GITHUB_ARCHIVE_TIMEOUT_MS,
-  sessionTtlMs: env.SESSION_TTL_MS,
-  sessionTokenBytes: env.SESSION_TOKEN_BYTES,
   allowServerKey: env.ALLOW_SERVER_KEY,
   serverKeyDailyCap: env.SERVER_KEY_DAILY_CAP,
   appEncryptionKey: env.APP_ENCRYPTION_KEY,
