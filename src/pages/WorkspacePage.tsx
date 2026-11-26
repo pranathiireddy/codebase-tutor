@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -21,7 +21,7 @@ import { SourceCodePanel } from '../components/SourceCodePanel';
 import { DiagramExplorerPanel } from '../components/DiagramExplorerPanel';
 import { OverviewWalkthroughPanel } from '../components/OverviewWalkthroughPanel';
 import { useApp } from '../context/AppContext';
-import { apiFetch as apiRequest, buildApiHeaders, safeJson } from '../utils/api';
+import { apiFetch, safeJson } from '../utils/api';
 import type {
   AnalyzedFileMeta,
   ChatCitation,
@@ -47,20 +47,43 @@ type ExplorationMode = 'overview' | 'code' | 'diagrams';
 export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
   const { repositoryId } = useParams<{ repositoryId?: string }>();
   const navigate = useNavigate();
-  const { preferences, credentials, updateCredentials, setCredentialStatus } = useApp();
-  const apiCredentials = useMemo(() => credentials, [credentials]);
-  const apiFetch = useCallback(
-    (input: RequestInfo | URL, init?: RequestInit) => {
-      const headers = new Headers(init?.headers);
-      for (const [name, value] of Object.entries(buildApiHeaders(apiCredentials))) {
-        headers.set(name, value);
-      }
-      return apiRequest(input, { ...init, headers });
-    },
-    [apiCredentials]
-  );
+  const { preferences, user, setCredentialStatus } = useApp();
 
   const targetRepoId = repositoryId || 'dietrichgebert__ponytail';
+  const [hasCustomGeminiKey, setHasCustomGeminiKey] = useState(false);
+  const [geminiKeyStatusError, setGeminiKeyStatusError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!user || readOnly) {
+      setHasCustomGeminiKey(false);
+      setGeminiKeyStatusError(null);
+      return;
+    }
+    setGeminiKeyStatusError(null);
+    void apiFetch('/api/settings/keys')
+      .then(async (res) => {
+        const payload = await safeJson<{ keys?: Array<{ provider: string }> }>(res);
+        if (!res.ok) throw new Error('Unable to load saved API key status.');
+        if (res.ok && !cancelled) {
+          setHasCustomGeminiKey(payload.keys?.some((key) => key.provider === 'gemini') ?? false);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setGeminiKeyStatusError(
+            error instanceof TypeError
+              ? 'The server is unavailable; saved key status could not be loaded.'
+              : error instanceof Error
+                ? error.message
+                : 'Unable to load saved API key status.'
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user, readOnly]);
 
   const [repositories, setRepositories] = useState<RepositoryRecord[]>([]);
   const [repository, setRepository] = useState<RepositoryRecord | null>(null);
@@ -259,7 +282,7 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
         params.set('beforeCreatedAt', String(cursor.createdAt));
         params.set('beforeId', cursor.id);
       }
-      const res = await apiRequest(`/api/chats/${encodeURIComponent(chatId)}/messages?${params}`);
+      const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}/messages?${params}`);
       const payload = await safeJson<{
         messages: ChatMessage[];
         hasMore: boolean;
@@ -284,8 +307,8 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
     async function loadWorkspaceHistory() {
       try {
         const [chatsResult, progressResult] = await Promise.allSettled([
-          apiRequest(`/api/repositories/${encodeURIComponent(targetRepoId)}/chats`),
-          apiRequest(`/api/repositories/${encodeURIComponent(targetRepoId)}/progress`),
+          apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/chats`),
+          apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/progress`),
         ]);
         if (chatsResult.status === 'rejected') throw chatsResult.reason;
         const chatsRes = chatsResult.value;
@@ -919,14 +942,12 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
   const sendQuestion = useCallback(
     async (
       question: string,
-      overrideContext?: ChatContext,
-      overrideCreds?: typeof credentials
+      overrideContext?: ChatContext
     ) => {
       if (readOnly) {
         navigate('/login');
         return;
       }
-      const credsToUse = overrideCreds ?? credentials;
       const ctxToUse = overrideContext ?? currentChatContext;
       const contextLabels: string[] = [];
       if (ctxToUse.selectedNodeName) contextLabels.push(ctxToUse.selectedNodeName);
@@ -968,10 +989,7 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
 
         const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}/messages`, {
           method: 'POST',
-          headers: buildApiHeaders(
-            credsToUse,
-            { 'Content-Type': 'application/json' }
-          ),
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             question,
             contextLabel: contextLabels.join(' · '),
@@ -986,14 +1004,6 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
 
         if (!json.userMessage || !json.assistantMessage) {
           throw new Error('The server returned an incomplete chat response.');
-        }
-
-        if (
-          credsToUse.geminiApiKey.trim() &&
-          json.modelUsed &&
-          json.modelUsed !== credsToUse.geminiModel
-        ) {
-          updateCredentials({ geminiModel: json.modelUsed });
         }
 
         if (activeChatIdRef.current === chatId) {
@@ -1039,8 +1049,6 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
     [
       currentChatContext,
       explorationMode,
-      credentials,
-      updateCredentials,
       readOnly,
       navigate,
       createChat,
@@ -1051,50 +1059,54 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
   const handleQuickApplyGeminiKey = useCallback(
     async (apiKey: string, retryQuestion?: string): Promise<string | null> => {
       try {
-        let resolvedModel = credentials.geminiModel;
-        const res = await apiFetch('/api/settings/verify', {
+        const model = 'gemini-4-hydrogen';
+        const res = await apiFetch('/api/settings/keys/gemini/test', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            geminiApiKey: apiKey,
-            geminiModel: credentials.geminiModel,
+            value: apiKey,
+            model,
           }),
         });
         const json = await safeJson<{
-          gemini?: { valid: boolean; model: string; note?: string; error?: string };
+          valid?: boolean;
+          model?: string;
           error?: string;
+          note?: string;
         }>(res);
         if (!res.ok) {
           return json.error || 'Failed to verify Gemini API key.';
         }
-        if (!json.gemini?.valid) {
-          return json.gemini?.error || 'Gemini API key verification failed.';
+        if (!json.valid) {
+          return json.error || 'Gemini API key verification failed.';
         }
-        resolvedModel = json.gemini.model || credentials.geminiModel;
-
-        const nextCreds = {
-          ...credentials,
-          geminiApiKey: apiKey,
-          geminiModel: resolvedModel,
-        };
-        updateCredentials({
-          geminiApiKey: nextCreds.geminiApiKey,
-          geminiModel: nextCreds.geminiModel,
+        const resolvedModel = json.model || model;
+        const saveResponse = await apiFetch('/api/settings/keys/gemini', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: apiKey, model: resolvedModel }),
         });
+        const saved = await safeJson<{ error?: string }>(saveResponse);
+        if (!saveResponse.ok) return saved.error || 'Gemini API key could not be saved.';
+        setHasCustomGeminiKey(true);
         setCredentialStatus({
           geminiVerified: true,
-          geminiMessage: `Verified (${nextCreds.geminiModel})`,
+          geminiMessage: `Verified (${resolvedModel})`,
           githubVerified: null,
         });
         if (retryQuestion) {
-          void sendQuestion(retryQuestion, undefined, nextCreds);
+          void sendQuestion(retryQuestion);
         }
         return null;
       } catch (err) {
-        return err instanceof Error ? err.message : 'Verification failed.';
+        return err instanceof TypeError
+          ? 'Unable to reach the server. Your key was not saved; check the connection and try again.'
+          : err instanceof Error
+            ? err.message
+            : 'Verification failed.';
       }
     },
-    [credentials, updateCredentials, setCredentialStatus, sendQuestion, apiFetch]
+    [setCredentialStatus, sendQuestion]
   );
 
   const handleQuickImport = async (e: React.FormEvent) => {
@@ -1104,15 +1116,7 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
       return;
     }
     setImportError(null);
-    let targetInput = importUrl.trim();
-    if (
-      credentials.githubDefaultOwner.trim() &&
-      targetInput &&
-      !targetInput.includes('/') &&
-      !targetInput.includes(':')
-    ) {
-      targetInput = `${credentials.githubDefaultOwner.trim()}/${targetInput}`;
-    }
+    const targetInput = importUrl.trim();
     try {
       const res = await apiFetch('/api/repositories/analyze', {
         method: 'POST',
@@ -1403,8 +1407,8 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
                 messages={messages}
                 loading={chatLoading}
                 context={currentChatContext}
-                credentials={credentials}
-                hasCustomGeminiKey={Boolean(credentials.geminiApiKey.trim())}
+                hasCustomGeminiKey={hasCustomGeminiKey}
+                keyStatusError={geminiKeyStatusError ?? undefined}
                 onQuickApplyGeminiKey={handleQuickApplyGeminiKey}
                 onClearAttachedCode={() => setAttachedCode(undefined)}
                 onAttachCode={(att) => void handleAttachCode(att)}

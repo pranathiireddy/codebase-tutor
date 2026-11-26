@@ -1,9 +1,3 @@
-export interface ApiCredentialHeaders {
-  geminiApiKey?: string;
-  geminiModel?: string;
-  githubToken?: string;
-}
-
 export class ApiHtmlFallbackError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -104,23 +98,6 @@ export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {})
     );
   }
   return response;
-}
-
-export function buildApiHeaders(
-  creds?: ApiCredentialHeaders,
-  extra?: Record<string, string>
-): Record<string, string> {
-  const headers: Record<string, string> = { ...(extra ?? {}) };
-  if (creds?.geminiApiKey?.trim()) {
-    headers['x-gemini-api-key'] = creds.geminiApiKey.trim();
-  }
-  if (creds?.geminiModel?.trim()) {
-    headers['x-gemini-model'] = creds.geminiModel.trim();
-  }
-  if (creds?.githubToken?.trim()) {
-    headers['x-github-token'] = creds.githubToken.trim();
-  }
-  return headers;
 }
 
 export async function safeJson<T>(res: Response): Promise<T> {

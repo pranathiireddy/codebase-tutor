@@ -1,12 +1,22 @@
+import crypto from 'node:crypto';
 import { GoogleGenAI, Type } from '@google/genai';
 import type { ChatCitation, ChatContext } from '../src/types/codebase.ts';
 import type { AnalyzedRepoData } from './repoStore.ts';
 import { retrieveRepositoryEvidence } from './retriever.ts';
 import { config } from './config.ts';
+import { redactSecrets } from './redaction.ts';
 
-let cachedAi: GoogleGenAI | null = null;
-let cachedApiKey: string | null = null;
-let serverKeyRejected = false;
+interface GeminiClientEntry {
+  text: GoogleGenAI;
+  tts: GoogleGenAI;
+  expiresAt: number;
+}
+
+const CLIENT_CACHE_LIMIT = 16;
+const CLIENT_CACHE_TTL_MS = 5 * 60 * 1000;
+const REJECTION_TTL_MS = 30 * 60 * 1000;
+const clientCache = new Map<string, GeminiClientEntry>();
+const rejectedKeyFingerprints = new Map<string, number>();
 
 const ALLOWED_MODEL_RE = /^[a-z0-9][a-z0-9._-]{1,63}$/i;
 const DEFAULT_MODEL = 'gemini-4-hydrogen';
@@ -18,8 +28,37 @@ const PUBLIC_FALLBACK_MODELS = [
   'gemini-3.1-flash-lite',
 ];
 
-export function isServerGeminiKeyRejected(): boolean {
-  return serverKeyRejected;
+function keyFingerprint(apiKey: string): string {
+  return crypto.createHash('sha256').update(apiKey).digest('hex');
+}
+
+function getRejectedAt(fingerprint: string): number | undefined {
+  const rejectedAt = rejectedKeyFingerprints.get(fingerprint);
+  if (rejectedAt === undefined) return undefined;
+  if (Date.now() - rejectedAt >= REJECTION_TTL_MS) {
+    rejectedKeyFingerprints.delete(fingerprint);
+    return undefined;
+  }
+  return rejectedAt;
+}
+
+function markKeyRejected(fingerprint: string): void {
+  rejectedKeyFingerprints.delete(fingerprint);
+  rejectedKeyFingerprints.set(fingerprint, Date.now());
+  while (rejectedKeyFingerprints.size > 64) {
+    const oldest = rejectedKeyFingerprints.keys().next().value;
+    if (oldest === undefined) break;
+    rejectedKeyFingerprints.delete(oldest);
+  }
+}
+
+function markKeyAccepted(fingerprint: string): void {
+  rejectedKeyFingerprints.delete(fingerprint);
+}
+
+export function isServerGeminiKeyRejected(apiKey = config.geminiApiKey): boolean {
+  const clean = sanitizeKey(apiKey);
+  return Boolean(clean && getRejectedAt(keyFingerprint(clean)));
 }
 
 function resolveModel(modelOverride?: string): string {
@@ -63,27 +102,34 @@ function createTtsGenAIClient(apiKey: string, isServerKey: boolean): GoogleGenAI
   return new GoogleGenAI({ apiKey, apiVersion: 'v1beta' });
 }
 
-function getGeminiClient(apiKeyOverride?: string): { ai: GoogleGenAI; isServerKey: boolean } {
-  const custom = sanitizeKey(apiKeyOverride);
-  const envKey = config.allowServerKey ? sanitizeKey(config.geminiApiKey) : '';
-  const isServerKey = !custom;
-  const apiKey = custom || envKey;
-
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error(
-      config.allowServerKey
-        ? 'GEMINI_API_KEY is not configured. Please enter your Gemini API key in Settings.'
-        : 'Server Gemini key use is disabled. Please enter your own Gemini API key in Settings.'
-    );
+function getClientEntry(apiKey: string, fingerprint: string, isServerKey: boolean): GeminiClientEntry {
+  const cacheKey = `${fingerprint}:${isServerKey ? 'server' : 'user'}`;
+  const now = Date.now();
+  let entry = clientCache.get(cacheKey);
+  if (entry && entry.expiresAt <= now) {
+    clientCache.delete(cacheKey);
+    entry = undefined;
   }
-  if (!cachedAi || cachedApiKey !== apiKey) {
-    cachedAi = createGenAIClient(apiKey, isServerKey);
-    cachedApiKey = apiKey;
+  if (!entry) {
+    entry = {
+      text: createGenAIClient(apiKey, isServerKey),
+      tts: createTtsGenAIClient(apiKey, isServerKey),
+      expiresAt: now + CLIENT_CACHE_TTL_MS,
+    };
   }
-  return { ai: cachedAi, isServerKey };
+  clientCache.delete(cacheKey);
+  clientCache.set(cacheKey, entry);
+  while (clientCache.size > CLIENT_CACHE_LIMIT) {
+    const oldest = clientCache.keys().next().value;
+    if (oldest === undefined) break;
+    clientCache.delete(oldest);
+  }
+  return entry;
 }
 
-function getTtsGeminiClient(apiKeyOverride?: string): { ai: GoogleGenAI; isServerKey: boolean } {
+function getGeminiClient(
+  apiKeyOverride?: string
+): { ai: GoogleGenAI; isServerKey: boolean; fingerprint: string } {
   const custom = sanitizeKey(apiKeyOverride);
   const envKey = config.allowServerKey ? sanitizeKey(config.geminiApiKey) : '';
   const isServerKey = !custom;
@@ -96,7 +142,29 @@ function getTtsGeminiClient(apiKeyOverride?: string): { ai: GoogleGenAI; isServe
         : 'Server Gemini key use is disabled. Please enter your own Gemini API key in Settings.'
     );
   }
-  return { ai: createTtsGenAIClient(apiKey, isServerKey), isServerKey };
+  const fingerprint = keyFingerprint(apiKey);
+  const entry = getClientEntry(apiKey, fingerprint, isServerKey);
+  return { ai: entry.text, isServerKey, fingerprint };
+}
+
+function getTtsGeminiClient(
+  apiKeyOverride?: string
+): { ai: GoogleGenAI; isServerKey: boolean; fingerprint: string } {
+  const custom = sanitizeKey(apiKeyOverride);
+  const envKey = config.allowServerKey ? sanitizeKey(config.geminiApiKey) : '';
+  const isServerKey = !custom;
+  const apiKey = custom || envKey;
+
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+    throw new Error(
+      config.allowServerKey
+        ? 'GEMINI_API_KEY is not configured. Please enter your Gemini API key in Settings.'
+        : 'Server Gemini key use is disabled. Please enter your own Gemini API key in Settings.'
+    );
+  }
+  const fingerprint = keyFingerprint(apiKey);
+  const entry = getClientEntry(apiKey, fingerprint, isServerKey);
+  return { ai: entry.tts, isServerKey, fingerprint };
 }
 
 function isAuthOrKeyError(raw: string): boolean {
@@ -124,7 +192,7 @@ function isModelNotFoundError(raw: string): boolean {
 }
 
 function sanitizeErrorMessage(raw: string, apiKey: string): string {
-  const cleaned = apiKey ? raw.split(apiKey).join('[REDACTED]') : raw;
+  const cleaned = redactSecrets(apiKey ? raw.split(apiKey).join('[REDACTED]') : raw);
   try {
     const parsed = JSON.parse(cleaned) as { error?: { message?: string } };
     if (parsed?.error?.message) return parsed.error.message;
@@ -320,7 +388,7 @@ export async function generateGroundedExplanation(
   history: { role: 'user' | 'assistant'; content: string }[],
   options?: { apiKeyOverride?: string; modelOverride?: string }
 ): Promise<GeminiAnswerResult> {
-  const { ai, isServerKey } = getGeminiClient(options?.apiKeyOverride);
+  const { ai, isServerKey, fingerprint } = getGeminiClient(options?.apiKeyOverride);
   let activeModel = resolveModel(options?.modelOverride);
   const retrieved = retrieveRepositoryEvidence(repo, question, context);
 
@@ -401,7 +469,7 @@ export async function generateGroundedExplanation(
   let response;
   try {
     response = await callStructured(activeModel);
-    if (isServerKey) serverKeyRejected = false;
+    markKeyAccepted(fingerprint);
   } catch (err) {
     const raw = err instanceof Error ? err.message : String(err);
     const explicitlyInvalidKey =
@@ -409,8 +477,8 @@ export async function generateGroundedExplanation(
       raw.includes('API key not valid') ||
       raw.includes('leaked');
 
-    if (explicitlyInvalidKey || (isServerKey && isAuthOrKeyError(raw))) {
-      if (isServerKey) serverKeyRejected = true;
+    if (explicitlyInvalidKey || isAuthOrKeyError(raw)) {
+      markKeyRejected(fingerprint);
       throw new Error(
         isServerKey
           ? 'GEMINI_API_KEY is missing, invalid, or restricted. Please enter your own Gemini API key in Settings.'
@@ -443,6 +511,7 @@ export async function generateGroundedExplanation(
             retryRaw.includes('API key not valid') ||
             retryRaw.includes('leaked')
           ) {
+            markKeyRejected(fingerprint);
             throw new Error(
               `Your Gemini API key was rejected: ${sanitizeErrorMessage(retryRaw, sanitizeKey(options?.apiKeyOverride))}`
             );
@@ -454,6 +523,7 @@ export async function generateGroundedExplanation(
           `Gemini request failed (${sanitizeErrorMessage(lastRetryRaw, sanitizeKey(options?.apiKeyOverride))}). Check your Gemini API key or select a different model in Settings.`
         );
       }
+      markKeyAccepted(fingerprint);
     } else if (raw.includes('INVALID_ARGUMENT') || raw.toLowerCase().includes('schema') || raw.toLowerCase().includes('json')) {
       response = await callPlainMarkdown(activeModel);
     } else if (raw.includes('RESOURCE_EXHAUSTED') || raw.includes('429')) {
@@ -614,7 +684,7 @@ export async function generateSpeechAudio(
   text: string,
   options?: { apiKeyOverride?: string }
 ): Promise<{ audioBase64: string; mimeType: string; spokenText: string; modelUsed: string }> {
-  const { ai, isServerKey } = getTtsGeminiClient(options?.apiKeyOverride);
+  const { ai, isServerKey, fingerprint } = getTtsGeminiClient(options?.apiKeyOverride);
   const spokenText = prepareSpokenText(text, 600);
 
   const callTtsModel = async (modelName: string) => {
@@ -649,7 +719,7 @@ export async function generateSpeechAudio(
 
   try {
     response = await callTtsModel(DEFAULT_TTS_MODEL);
-    if (isServerKey) serverKeyRejected = false;
+    markKeyAccepted(fingerprint);
   } catch (err) {
     const raw = err instanceof Error ? err.message : String(err);
     const explicitlyInvalidKey =
@@ -657,8 +727,8 @@ export async function generateSpeechAudio(
       raw.includes('API key not valid') ||
       raw.includes('leaked');
 
-    if (explicitlyInvalidKey || (isServerKey && isAuthOrKeyError(raw))) {
-      if (isServerKey) serverKeyRejected = true;
+    if (explicitlyInvalidKey || isAuthOrKeyError(raw)) {
+      markKeyRejected(fingerprint);
       throw new Error(
         isServerKey
           ? 'GEMINI_API_KEY is missing, invalid, or restricted for audio synthesis.'
@@ -683,6 +753,7 @@ export async function generateSpeechAudio(
       if (!recovered) {
         throw new Error(`TTS unavailable: ${sanitizeErrorMessage(lastErr, sanitizeKey(options?.apiKeyOverride))}`);
       }
+      markKeyAccepted(fingerprint);
     } else if (raw.includes('RESOURCE_EXHAUSTED') || raw.includes('429')) {
       throw new Error('Gemini TTS rate limit reached (429).');
     } else {

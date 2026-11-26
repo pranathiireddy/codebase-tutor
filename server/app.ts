@@ -40,6 +40,12 @@ import {
   getUserPreferences,
   findUserByEmail,
   findUserById,
+  getUserApiKey,
+  listUserApiKeys,
+  saveUserApiKey,
+  markUserApiKeyUsed,
+  updateUserApiKeyModel,
+  deleteUserApiKey,
   insertUser,
   listChatsForRepository,
   listExploredItems,
@@ -57,6 +63,7 @@ import {
   revokeSession,
   saveChatMessage,
   saveUserPreferences,
+  type UserApiKeyProvider,
   type ChatMessageRecord,
 } from './db/index.ts';
 import {
@@ -88,7 +95,8 @@ import {
 } from './auth.ts';
 import type { ChatCitation, ChatContext, DiagramType, UserProfile } from '../src/types/codebase.ts';
 import { getGitHubAuthorizationUrl, fetchGitHubIdentity, GitHubOAuthError } from './githubOAuth.ts';
-import { encryptSecret, decryptSecret } from './secretCrypto.ts';
+import { decryptSecret, decryptUserApiKey, encryptSecret, encryptUserApiKey } from './secretCrypto.ts';
+import { redactErrorFields, redactSecrets } from './redaction.ts';
 import {
   getGitHubAppInstallUrl,
   getGitHubAppTokenForRepository,
@@ -157,6 +165,11 @@ function serializeChatMessage(message: ChatMessageRecord) {
 
 export function createApp(): express.Express {
   const app = express();
+  app.use((_req: Request, res: Response, next: NextFunction) => {
+    const sendJson = res.json.bind(res);
+    res.json = ((body: unknown) => sendJson(redactErrorFields(body))) as Response['json'];
+    next();
+  });
   app.use(express.json({ limit: config.jsonBodyLimitBytes }));
   app.use(cookieParser());
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -180,7 +193,7 @@ export function createApp(): express.Express {
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, X-Csrf-Token, X-Gemini-Api-Key, X-Gemini-Model, X-Github-Token'
+      'Content-Type, X-Csrf-Token'
     );
     if (req.method === 'OPTIONS') {
       res.sendStatus(204);
@@ -211,10 +224,17 @@ export function createApp(): express.Express {
     });
   }
 
-  function reserveServerKeyRequest(userId: string, apiKeyOverride?: string): boolean {
-    if (apiKeyOverride?.trim() || !config.allowServerKey) return true;
+  function reserveServerKeyRequest(userId: string, hasUserKey: boolean): boolean {
+    if (hasUserKey || !config.allowServerKey) return true;
     const today = new Date().toISOString().slice(0, 10);
     return consumeGeminiDailyQuota(userId, today, config.serverKeyDailyCap);
+  }
+
+  function getUserKey(userId: string, provider: UserApiKeyProvider): string | undefined {
+    const record = getUserApiKey(userId, provider);
+    if (!record) return undefined;
+    markUserApiKeyUsed(userId, provider, Date.now());
+    return decryptUserApiKey(record);
   }
 
   const githubStartLimiter = rateLimit({
@@ -879,61 +899,144 @@ app.get('/api/repositories', optionalAuth, (_req: Request, res: Response) => {
   });
 });
 
-// Settings status & credential verification (never returns server secrets)
+// Settings status and user-scoped encrypted API keys
 app.get('/api/settings/status', requireAuth, (_req: Request, res: Response) => {
   const geminiKey = config.geminiApiKey ?? '';
   const githubTok = config.githubToken ?? '';
   res.json({
     hasServerGeminiKey:
-      config.allowServerKey && Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY') && !isServerGeminiKeyRejected(),
+      config.allowServerKey &&
+      Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY') &&
+      !isServerGeminiKeyRejected(geminiKey),
     serverGeminiRejected: isServerGeminiKeyRejected(),
     hasServerGithubToken: Boolean(githubTok),
   });
 });
 
-app.post('/api/settings/verify', requireAuth, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as {
-    geminiApiKey?: string;
-    geminiModel?: string;
-    githubToken?: string;
-  };
-  const geminiKey = (body.geminiApiKey ?? req.header('x-gemini-api-key') ?? '').trim();
-  const geminiModel = (body.geminiModel ?? req.header('x-gemini-model') ?? '').trim();
-  const githubToken = (body.githubToken ?? req.header('x-github-token') ?? '').trim();
+const userKeyProviders = new Set<UserApiKeyProvider>(['gemini', 'github', 'github_owner']);
 
-  const result: {
-    gemini?: { valid: boolean; model: string; error?: string };
-    github?: { valid: boolean; username?: string; remaining?: number; limit?: number; error?: string };
-  } = {};
+function parseUserKeyProvider(value: string): UserApiKeyProvider | undefined {
+  return userKeyProviders.has(value as UserApiKeyProvider) ? value as UserApiKeyProvider : undefined;
+}
 
-  if (geminiKey) {
-    result.gemini = await verifyGeminiApiKey(geminiKey, geminiModel || undefined);
+app.get('/api/settings/keys', requireAuth, (_req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  res.json({ keys: listUserApiKeys(user.id) });
+});
+
+app.post('/api/settings/keys/:provider/test', requireAuth, async (req: Request, res: Response) => {
+  const provider = parseUserKeyProvider(String(req.params.provider));
+  const user = getRequestUser(res)!;
+  const body = req.body as { value?: unknown; model?: unknown };
+  const value = typeof body.value === 'string' ? body.value.trim() : '';
+  const model = typeof body.model === 'string' ? body.model.trim() : undefined;
+  if (!provider || !value || value.length > 4096) {
+    res.status(400).json({ valid: false, error: 'Enter a valid credential to test.' });
+    return;
   }
-  if (githubToken) {
-    result.github = await verifyGitHubToken(githubToken);
+
+  if (provider === 'gemini') {
+    const result = await verifyGeminiApiKey(value, model);
+    res.json({ ...result, error: result.error ? redactSecrets(result.error) : undefined });
+    return;
+  }
+  if (provider === 'github') {
+    const result = await verifyGitHubToken(value);
+    res.json({ ...result, error: result.error ? redactSecrets(result.error) : undefined });
+    return;
   }
 
-  res.json(result);
+  const owner = value.replace(/^@/, '');
+  const valid = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner);
+  res.json({
+    valid,
+    error: valid ? undefined : 'Enter a valid GitHub username or organization name.',
+  });
+});
+
+app.put('/api/settings/keys/:provider', requireAuth, (req: Request, res: Response) => {
+  const provider = parseUserKeyProvider(String(req.params.provider));
+  const user = getRequestUser(res)!;
+  const body = req.body as { value?: unknown; model?: unknown };
+  let value = typeof body.value === 'string' ? body.value.trim() : '';
+  const model = typeof body.model === 'string' ? body.model.trim() : null;
+  if (!provider || !value || value.length > 4096) {
+    res.status(400).json({ error: 'Enter a valid credential to save.' });
+    return;
+  }
+  if (provider === 'github_owner') value = value.replace(/^@/, '');
+  if (
+    (provider === 'github_owner' &&
+      !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(value)) ||
+    (provider === 'gemini' &&
+      model !== null &&
+      (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$/.test(model)))
+  ) {
+    res.status(400).json({ error: 'Credential details are invalid.' });
+    return;
+  }
+  const encrypted = encryptUserApiKey(value);
+  saveUserApiKey(
+    {
+      id: crypto.randomUUID(),
+      userId: user.id,
+      provider,
+      ...encrypted,
+      last4: value.slice(-4),
+      model: provider === 'gemini' ? model || 'gemini-4-hydrogen' : null,
+    },
+    Date.now()
+  );
+  res.json({ ok: true, provider });
+});
+
+app.delete('/api/settings/keys/:provider', requireAuth, (req: Request, res: Response) => {
+  const provider = parseUserKeyProvider(String(req.params.provider));
+  if (!provider) {
+    res.status(400).json({ error: 'Unknown credential provider.' });
+    return;
+  }
+  const user = getRequestUser(res)!;
+  res.json({ deleted: deleteUserApiKey(user.id, provider) });
+});
+
+app.patch('/api/settings/keys/gemini', requireAuth, (req: Request, res: Response) => {
+  const user = getRequestUser(res)!;
+  const model = typeof req.body?.model === 'string' ? req.body.model.trim() : '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$/.test(model)) {
+    res.status(400).json({ error: 'Enter a valid Gemini model name.' });
+    return;
+  }
+  if (!getUserApiKey(user.id, 'gemini')) {
+    res.status(404).json({ error: 'Save a Gemini API key before changing its model.' });
+    return;
+  }
+  updateUserApiKeyModel(user.id, 'gemini', model);
+  res.json({ ok: true });
 });
 
 app.post('/api/repositories/analyze', requireAuth, async (req: Request, res: Response) => {
   const user = getRequestUser(res)!;
   const { url, forceRefresh } = req.body as { url?: string; forceRefresh?: boolean };
-  let githubToken = req.header('x-github-token')?.trim() || undefined;
   if (!url || typeof url !== 'string') {
     res.status(400).json({ error: 'Repository URL is required.' });
     return;
   }
   try {
+    const defaultOwner = getUserKey(user.id, 'github_owner');
+    const repositoryInput =
+      defaultOwner && !url.includes('/') && !url.includes(':') ? `${defaultOwner}/${url}` : url;
+    const userGitHubToken = getUserKey(user.id, 'github');
+    let githubToken = userGitHubToken;
     if (!githubToken) {
-      const repository = parseGitHubUrl(url);
+      const repository = parseGitHubUrl(repositoryInput);
       githubToken = await getGitHubAppTokenForRepository(
         user.id,
         repository.owner,
         repository.name
       );
     }
-    const record = await startRepositoryAnalysis(url, {
+    const record = await startRepositoryAnalysis(repositoryInput, {
       forceRefresh: Boolean(forceRefresh),
       githubToken,
       userId: user.id,
@@ -1469,9 +1572,10 @@ app.post('/api/chats/:chatId/messages', requireAuth, async (req: Request, res: R
     return;
   }
 
-  const apiKeyOverride = req.header('x-gemini-api-key')?.trim() || undefined;
-  const modelOverride = req.header('x-gemini-model')?.trim() || undefined;
-  if (!reserveServerKeyRequest(user.id, apiKeyOverride)) {
+  const userGeminiKey = getUserApiKey(user.id, 'gemini');
+  const apiKeyOverride = userGeminiKey ? decryptUserApiKey(userGeminiKey) : undefined;
+  const modelOverride = userGeminiKey?.model ?? undefined;
+  if (!reserveServerKeyRequest(user.id, Boolean(apiKeyOverride))) {
     res.status(429).json({ error: 'The server Gemini daily request limit has been reached. Try again tomorrow or use your own key.' });
     return;
   }
@@ -1503,6 +1607,12 @@ app.post('/api/chats/:chatId/messages', requireAuth, async (req: Request, res: R
       history,
       { apiKeyOverride, modelOverride }
     );
+    if (apiKeyOverride) {
+      markUserApiKeyUsed(user.id, 'gemini', Date.now());
+      if (result.modelUsed && result.modelUsed !== modelOverride) {
+        updateUserApiKeyModel(user.id, 'gemini', result.modelUsed);
+      }
+    }
     const assistantMessage = saveChatMessage(user.id, chatId, {
       id: crypto.randomUUID(),
       role: 'assistant',
@@ -1538,13 +1648,15 @@ app.post('/api/tts', requireAuth, async (req: Request, res: Response) => {
     return;
   }
 
-  const apiKeyOverride = req.header('x-gemini-api-key')?.trim() || undefined;
-  if (!reserveServerKeyRequest(user.id, apiKeyOverride)) {
+  const userGeminiKey = getUserApiKey(user.id, 'gemini');
+  const apiKeyOverride = userGeminiKey ? decryptUserApiKey(userGeminiKey) : undefined;
+  if (!reserveServerKeyRequest(user.id, Boolean(apiKeyOverride))) {
     res.status(429).json({ error: 'The server Gemini daily request limit has been reached. Try again tomorrow or use your own key.' });
     return;
   }
   try {
     const audio = await generateSpeechAudio(text, { apiKeyOverride });
+    if (apiKeyOverride) markUserApiKeyUsed(user.id, 'gemini', Date.now());
     res.json(audio);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to synthesize speech.';

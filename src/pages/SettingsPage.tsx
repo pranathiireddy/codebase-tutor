@@ -24,20 +24,21 @@ interface ServerKeyStatus {
 }
 
 interface VerifyResponse {
-  gemini?: {
-    valid: boolean;
-    model: string;
-    availableModels?: string[];
-    note?: string;
-    error?: string;
-  };
-  github?: {
-    valid: boolean;
-    username?: string;
-    remaining?: number;
-    limit?: number;
-    error?: string;
-  };
+  valid: boolean;
+  model?: string;
+  note?: string;
+  username?: string;
+  remaining?: number;
+  limit?: number;
+  error?: string;
+}
+
+interface SavedApiKey {
+  provider: 'gemini' | 'github' | 'github_owner';
+  last4: string;
+  model: string | null;
+  createdAt: number;
+  lastUsedAt: number | null;
 }
 
 interface GitHubSettingsStatus {
@@ -63,34 +64,25 @@ export function SettingsPage() {
     updatePreferences,
     preferencesError,
     user,
-    credentials,
-    updateCredentials,
-    clearCredentials,
     credentialStatus,
     setCredentialStatus,
   } = useApp();
 
   const [cacheMessage, setCacheMessage] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
-
-  const [geminiApiKey, setGeminiApiKey] = useState(credentials.geminiApiKey);
-  const initialIsPreset = PRESET_MODELS.includes(
-    credentials.geminiModel as (typeof PRESET_MODELS)[number]
-  );
-  const [modelPreset, setModelPreset] = useState<string>(
-    initialIsPreset ? credentials.geminiModel : 'custom'
-  );
-  const [customModel, setCustomModel] = useState<string>(
-    initialIsPreset ? '' : credentials.geminiModel
-  );
-  const [githubToken, setGithubToken] = useState(credentials.githubToken);
-  const [githubDefaultOwner, setGithubDefaultOwner] = useState(credentials.githubDefaultOwner);
+  const [geminiApiKey, setGeminiApiKey] = useState('');
+  const [modelPreset, setModelPreset] = useState<string>('gemini-4-hydrogen');
+  const [customModel, setCustomModel] = useState('');
+  const [githubToken, setGithubToken] = useState('');
+  const [githubDefaultOwner, setGithubDefaultOwner] = useState('');
 
   const [showGeminiKey, setShowGeminiKey] = useState(false);
   const [showGithubToken, setShowGithubToken] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [verifyError, setVerifyError] = useState<string | null>(null);
   const [savedBanner, setSavedBanner] = useState<string | null>(null);
+  const [savedKeys, setSavedKeys] = useState<SavedApiKey[]>([]);
+  const [keysLoading, setKeysLoading] = useState(true);
   const [serverStatus, setServerStatus] = useState<ServerKeyStatus | null>(null);
   const [githubSettings, setGithubSettings] = useState<GitHubSettingsStatus | null>(null);
   const [githubSettingsError, setGithubSettingsError] = useState<string | null>(null);
@@ -101,6 +93,46 @@ export function SettingsPage() {
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [passwordBusy, setPasswordBusy] = useState(false);
+
+  const loadSavedKeys = async () => {
+    const res = await apiFetch('/api/settings/keys');
+    const data = await safeJson<{ keys?: SavedApiKey[]; error?: string }>(res);
+    if (!res.ok) throw new Error(data.error || 'Unable to load saved API keys.');
+    setSavedKeys(data.keys ?? []);
+    const gemini = data.keys?.find((key) => key.provider === 'gemini');
+    if (gemini?.model) syncModelSelection(gemini.model);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    void apiFetch('/api/settings/keys')
+      .then(async (res) => {
+        const data = await safeJson<{ keys?: SavedApiKey[]; error?: string }>(res);
+        if (!res.ok) throw new Error(data.error || 'Unable to load saved API keys.');
+        if (!cancelled) {
+          setSavedKeys(data.keys ?? []);
+          const gemini = data.keys?.find((key) => key.provider === 'gemini');
+          if (gemini?.model) syncModelSelection(gemini.model);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setVerifyError(
+            error instanceof TypeError
+              ? 'The server is unavailable. Saved API key settings could not be loaded.'
+              : error instanceof Error
+                ? error.message
+                : 'Unable to load saved API keys.'
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setKeysLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -167,7 +199,7 @@ export function SettingsPage() {
       ? customModel.trim() || 'gemini-4-hydrogen'
       : modelPreset;
 
-  const syncModelSelection = (resolvedModel: string) => {
+  function syncModelSelection(resolvedModel: string): void {
     if (PRESET_MODELS.includes(resolvedModel as (typeof PRESET_MODELS)[number])) {
       setModelPreset(resolvedModel);
       setCustomModel('');
@@ -175,7 +207,7 @@ export function SettingsPage() {
       setModelPreset('custom');
       setCustomModel(resolvedModel);
     }
-  };
+  }
 
   const handleSaveAndVerify = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -185,83 +217,124 @@ export function SettingsPage() {
     const trimmedGemini = geminiApiKey.trim().replace(/^["']|["']$/g, '').trim();
     const trimmedGithub = githubToken.trim().replace(/^["']|["']$/g, '').trim();
     const trimmedOwner = githubDefaultOwner.trim().replace(/^@/, '');
-
-    setGeminiApiKey(trimmedGemini);
-    setGithubToken(trimmedGithub);
-
-    updateCredentials({
-      geminiApiKey: trimmedGemini,
-      geminiModel: effectiveModel,
-      githubToken: trimmedGithub,
-      githubDefaultOwner: trimmedOwner,
-    });
-
-    if (!trimmedGemini && !trimmedGithub) {
-      setCredentialStatus({ geminiVerified: null, githubVerified: null });
-      setSavedBanner('Workspace defaults applied for this browser session.');
-      return;
-    }
-
     setVerifying(true);
     try {
-      let json: VerifyResponse & { error?: string };
-      const res = await apiFetch('/api/settings/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          geminiApiKey: trimmedGemini || undefined,
-          geminiModel: effectiveModel,
-          githubToken: trimmedGithub || undefined,
-        }),
-      });
-      json = await safeJson<VerifyResponse & { error?: string }>(res);
-      if (!res.ok) {
-        throw new Error(json.error || 'Failed to verify credentials.');
-      }
+      const inputs: Array<{ provider: SavedApiKey['provider']; value: string; model?: string }> = [];
+      if (trimmedGemini) inputs.push({ provider: 'gemini', value: trimmedGemini, model: effectiveModel });
+      if (trimmedGithub) inputs.push({ provider: 'github', value: trimmedGithub });
+      if (trimmedOwner) inputs.push({ provider: 'github_owner', value: trimmedOwner });
 
-      if (json.gemini?.valid && json.gemini.model && json.gemini.model !== effectiveModel) {
-        updateCredentials({ geminiModel: json.gemini.model });
-        syncModelSelection(json.gemini.model);
-      }
+      const tested = await Promise.all(
+        inputs.map(async (input) => {
+          const res = await apiFetch(`/api/settings/keys/${input.provider}/test`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: input.value, model: input.model }),
+          });
+          const result = await safeJson<VerifyResponse>(res);
+          if (!res.ok) throw new Error(result.error || `Unable to test ${input.provider} credentials.`);
+          return { ...input, result };
+        })
+      );
 
+      const gemini = tested.find((entry) => entry.provider === 'gemini')?.result;
+      const github = tested.find((entry) => entry.provider === 'github')?.result;
       setCredentialStatus({
-        geminiVerified: json.gemini ? json.gemini.valid : null,
-        geminiMessage: json.gemini
-          ? json.gemini.valid
-            ? json.gemini.note
-              ? `Verified with ${json.gemini.model} (${json.gemini.note})`
-              : `Verified (${json.gemini.model})`
-            : json.gemini.error
+        geminiVerified: gemini ? gemini.valid : null,
+        geminiMessage: gemini
+          ? gemini.valid
+            ? gemini.note
+              ? `Verified with ${gemini.model} (${gemini.note})`
+              : `Verified (${gemini.model})`
+            : gemini.error
           : undefined,
-        githubVerified: json.github ? json.github.valid : null,
-        githubMessage: json.github
-          ? json.github.valid
-            ? `Authenticated as @${json.github.username} (${json.github.remaining ?? 0}/${json.github.limit ?? 5000} API calls left)`
-            : json.github.error
+        githubVerified: github ? github.valid : null,
+        githubMessage: github
+          ? github.valid
+            ? `Authenticated as @${github.username} (${github.remaining ?? 0}/${github.limit ?? 5000} API calls left)`
+            : github.error
           : undefined,
       });
 
-      if ((json.gemini && !json.gemini.valid) || (json.github && !json.github.valid)) {
+      if (tested.some((entry) => !entry.result.valid)) {
         setVerifyError('One or more credentials failed verification. Review the status messages below.');
-      } else {
-        setSavedBanner('Credentials verified and active for Tutor Chat and GitHub repository analysis.');
+        return;
       }
+
+      for (const entry of tested) {
+        const res = await apiFetch(`/api/settings/keys/${entry.provider}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            value: entry.value,
+            model: entry.provider === 'gemini' ? entry.result.model || effectiveModel : undefined,
+          }),
+        });
+        const result = await safeJson<{ error?: string }>(res);
+        if (!res.ok) throw new Error(result.error || `Unable to save ${entry.provider} credentials.`);
+      }
+
+      const existingGemini = savedKeys.find((key) => key.provider === 'gemini');
+      if (!trimmedGemini && existingGemini && existingGemini.model !== effectiveModel) {
+        const res = await apiFetch('/api/settings/keys/gemini', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: effectiveModel }),
+        });
+        const result = await safeJson<{ error?: string }>(res);
+        if (!res.ok) throw new Error(result.error || 'Unable to update the Gemini model.');
+      }
+      await loadSavedKeys();
+      setGeminiApiKey('');
+      setGithubToken('');
+      setGithubDefaultOwner('');
+      setSavedBanner(
+        inputs.length
+          ? 'Credentials verified and saved securely for your account.'
+          : 'No new credentials entered. Existing saved credentials are unchanged.'
+      );
     } catch (err) {
-      setVerifyError(err instanceof Error ? err.message : 'Unable to verify credentials.');
+      setVerifyError(
+        err instanceof TypeError
+          ? 'Unable to reach the server. Check your connection; reload this page to confirm whether any changes were saved.'
+          : err instanceof Error
+            ? err.message
+            : 'Unable to verify and save credentials.'
+      );
     } finally {
       setVerifying(false);
     }
   };
 
-  const handleClearKeys = () => {
-    clearCredentials();
+  const handleClearKeys = async () => {
+    setVerifying(true);
+    setVerifyError(null);
+    setSavedBanner(null);
+    try {
+      for (const provider of ['gemini', 'github', 'github_owner'] as const) {
+        const res = await apiFetch(`/api/settings/keys/${provider}`, { method: 'DELETE' });
+        const result = await safeJson<{ error?: string }>(res);
+        if (!res.ok) throw new Error(result.error || `Unable to remove ${provider} credentials.`);
+      }
+      setSavedKeys([]);
+      setCredentialStatus({ geminiVerified: null, githubVerified: null });
+      setSavedBanner('Custom API keys and the default GitHub owner were removed.');
+    } catch (err) {
+      setVerifyError(
+        err instanceof TypeError
+          ? 'Unable to reach the server. Some credentials may remain; reload to check.'
+          : err instanceof Error
+            ? err.message
+            : 'Unable to remove saved credentials.'
+      );
+    } finally {
+      setVerifying(false);
+    }
     setGeminiApiKey('');
     setModelPreset('gemini-4-hydrogen');
     setCustomModel('');
     setGithubToken('');
     setGithubDefaultOwner('');
-    setVerifyError(null);
-    setSavedBanner('Cleared custom API keys. Using server defaults if configured.');
   };
 
   const handleClearCache = async () => {
@@ -401,7 +474,7 @@ export function SettingsPage() {
         <header className="border-b border-[#232832] pb-5">
           <h1 className="text-2xl font-bold text-[#F9FAFB]">Workspace Settings</h1>
           <p className="mt-1 text-xs text-[#9CA3AF]">
-            Configure your own Gemini API key, GitHub credentials, code viewer typography, and analysis cache.
+            Manage encrypted server-side API keys, code viewer typography, and analysis cache.
           </p>
         </header>
 
@@ -565,7 +638,7 @@ export function SettingsPage() {
                 <span>API Keys & GitHub Credentials</span>
               </h2>
               <p className="mt-1 text-[11px] leading-relaxed text-[#9CA3AF]">
-                Bring your own Gemini API key for Codebase Tutor chat and your GitHub Personal Access Token for private repositories and higher API rate limits.
+                Keys are encrypted on the server and never returned to your browser. Leave a field blank to keep its saved value; enter a replacement to update it.
               </p>
             </div>
           </div>
@@ -573,7 +646,7 @@ export function SettingsPage() {
           <div className="flex items-start gap-2.5 rounded-lg border border-[#232832] bg-[#0B0D10] px-3.5 py-2.5 text-[11px] text-[#9CA3AF]">
             <ShieldCheck className="h-4 w-4 text-sky-400 shrink-0 mt-0.5" />
             <div>
-              Keys apply immediately for your active browser tab session (cleared when the tab closes) and are proxied via backend headers to <span className="font-mono text-[#D1D5DB]">/api/*</span>.
+              Saved credentials are encrypted and used only by the server for requests on your behalf.
               {serverStatus && (
                 <div className="mt-1 flex flex-wrap gap-3 text-[11px] text-[#6B7280]">
                   <span>
@@ -603,6 +676,29 @@ export function SettingsPage() {
             </div>
           </div>
 
+          <div className="rounded-lg border border-[#232832] bg-[#0B0D10] p-3 text-[11px] text-[#9CA3AF]">
+            <div className="mb-2 font-medium text-[#D1D5DB]">
+              {keysLoading ? 'Loading saved credentials...' : 'Saved credentials'}
+            </div>
+            {!keysLoading && savedKeys.length === 0 && <div>No custom credentials saved.</div>}
+            <div className="space-y-1">
+              {savedKeys.map((key) => (
+                <div key={key.provider} className="flex items-center justify-between gap-3">
+                  <span>
+                    {key.provider === 'github_owner'
+                      ? 'Default GitHub owner'
+                      : key.provider === 'github'
+                        ? 'GitHub token'
+                        : 'Gemini key'}
+                  </span>
+                  <span className="font-mono text-[#D1D5DB]">
+                    ...{key.last4}{key.provider === 'gemini' && key.model ? ` · ${key.model}` : ''}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
           <form onSubmit={handleSaveAndVerify} className="space-y-5">
             {/* Gemini Key & Model */}
             <div className="space-y-3">
@@ -611,7 +707,7 @@ export function SettingsPage() {
                   Gemini API Key
                 </label>
                 <p className="text-[11px] text-[#9CA3AF]">
-                  Overrides the server Gemini key for Tutor Chat explanations. Compatible models are auto-detected on verification.
+                  Used for Tutor Chat and speech synthesis. Compatible models are auto-detected when tested.
                 </p>
               </div>
               <div className="relative">
@@ -622,9 +718,8 @@ export function SettingsPage() {
                   onChange={(e) => {
                     const val = e.target.value;
                     setGeminiApiKey(val);
-                    updateCredentials({ geminiApiKey: val.trim() });
                   }}
-                  placeholder="AIza..."
+                  placeholder={savedKeys.some((key) => key.provider === 'gemini') ? 'Saved securely; enter a replacement' : 'AIza...'}
                   autoComplete="off"
                   className="w-full rounded-md border border-[#232832] bg-[#0B0D10] py-2 pl-3 pr-10 font-mono text-xs text-[#E6E9EF] placeholder-[#6B7280] focus:border-sky-500 focus:outline-none"
                 />
@@ -663,9 +758,6 @@ export function SettingsPage() {
                     onChange={(e) => {
                       const next = e.target.value;
                       setModelPreset(next);
-                      if (next !== 'custom') {
-                        updateCredentials({ geminiModel: next });
-                      }
                     }}
                     className="w-full rounded border border-[#232832] bg-[#0B0D10] px-3 py-1.5 font-mono text-xs text-[#E6E9EF] focus:border-sky-500 focus:outline-none"
                   >
@@ -689,9 +781,6 @@ export function SettingsPage() {
                       onChange={(e) => {
                         const val = e.target.value;
                         setCustomModel(val);
-                        if (val.trim()) {
-                          updateCredentials({ geminiModel: val.trim() });
-                        }
                       }}
                       placeholder="e.g. gemini-2.5-flash"
                       className="w-full rounded border border-[#232832] bg-[#0B0D10] px-3 py-1.5 font-mono text-xs text-[#E6E9EF] placeholder-[#6B7280] focus:border-sky-500 focus:outline-none"
@@ -720,9 +809,8 @@ export function SettingsPage() {
                   onChange={(e) => {
                     const val = e.target.value;
                     setGithubToken(val);
-                    updateCredentials({ githubToken: val.trim() });
                   }}
-                  placeholder="ghp_... or github_pat_..."
+                  placeholder={savedKeys.some((key) => key.provider === 'github') ? 'Saved securely; enter a replacement' : 'ghp_... or github_pat_...'}
                   autoComplete="off"
                   className="w-full rounded-md border border-[#232832] bg-[#0B0D10] py-2 pl-3 pr-10 font-mono text-xs text-[#E6E9EF] placeholder-[#6B7280] focus:border-sky-500 focus:outline-none"
                 />
@@ -761,7 +849,6 @@ export function SettingsPage() {
                   onChange={(e) => {
                     const val = e.target.value;
                     setGithubDefaultOwner(val);
-                    updateCredentials({ githubDefaultOwner: val.trim().replace(/^@/, '') });
                   }}
                   placeholder="e.g. octocat (allows entering bare repo names when importing)"
                   className="w-full rounded border border-[#232832] bg-[#0B0D10] px-3 py-1.5 font-mono text-xs text-[#E6E9EF] placeholder-[#6B7280] focus:border-sky-500 focus:outline-none"
@@ -798,16 +885,17 @@ export function SettingsPage() {
                 {verifying ? (
                   <>
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    <span>Verifying & Applying...</span>
+                    <span>Testing & Saving...</span>
                   </>
                 ) : (
-                  <span>Verify & Apply Keys</span>
+                  <span>Test & Save Credentials</span>
                 )}
               </button>
 
               <button
                 type="button"
                 onClick={handleClearKeys}
+                disabled={verifying || keysLoading}
                 className="inline-flex items-center gap-1.5 rounded-md border border-[#232832] bg-[#161A21] px-3 py-2 text-xs font-medium text-[#9CA3AF] hover:border-rose-500/50 hover:text-rose-300 cursor-pointer whitespace-nowrap"
               >
                 <Trash2 className="h-3.5 w-3.5" />

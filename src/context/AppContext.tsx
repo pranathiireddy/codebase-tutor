@@ -9,13 +9,6 @@ export interface WorkspacePreferences {
   chatRetentionDays: number;
 }
 
-export interface UserApiCredentials {
-  geminiApiKey: string;
-  geminiModel: string;
-  githubToken: string;
-  githubDefaultOwner: string;
-}
-
 export interface CredentialStatus {
   geminiVerified: boolean | null;
   geminiMessage?: string;
@@ -31,9 +24,6 @@ interface AppContextValue {
   preferences: WorkspacePreferences;
   updatePreferences: (partial: Partial<WorkspacePreferences>) => void;
   preferencesError: string | null;
-  credentials: UserApiCredentials;
-  updateCredentials: (partial: Partial<UserApiCredentials>) => void;
-  clearCredentials: () => void;
   credentialStatus: CredentialStatus;
   setCredentialStatus: (status: CredentialStatus) => void;
 }
@@ -47,46 +37,6 @@ const DEFAULT_PREFERENCES: WorkspacePreferences = {
   chatRetentionDays: 0,
 };
 
-const DEFAULT_CREDENTIALS: UserApiCredentials = {
-  geminiApiKey: '',
-  geminiModel: 'gemini-4-hydrogen',
-  githubToken: '',
-  githubDefaultOwner: '',
-};
-
-function loadInitialCredentials(): UserApiCredentials {
-  try {
-    if (typeof window === 'undefined' || !window.sessionStorage) return DEFAULT_CREDENTIALS;
-    const raw = window.sessionStorage.getItem(SESSION_CREDS_KEY);
-    if (!raw) return DEFAULT_CREDENTIALS;
-    const parsed = JSON.parse(raw) as Partial<UserApiCredentials>;
-    return {
-      geminiApiKey: typeof parsed.geminiApiKey === 'string' ? parsed.geminiApiKey : '',
-      geminiModel:
-        typeof parsed.geminiModel === 'string' && parsed.geminiModel.trim()
-          ? parsed.geminiModel
-          : DEFAULT_CREDENTIALS.geminiModel,
-      githubToken: typeof parsed.githubToken === 'string' ? parsed.githubToken : '',
-      githubDefaultOwner: typeof parsed.githubDefaultOwner === 'string' ? parsed.githubDefaultOwner : '',
-    };
-  } catch {
-    return DEFAULT_CREDENTIALS;
-  }
-}
-
-function saveSessionCredentials(creds: UserApiCredentials): void {
-  try {
-    if (typeof window === 'undefined' || !window.sessionStorage) return;
-    if (!creds.geminiApiKey && !creds.githubToken && !creds.githubDefaultOwner && creds.geminiModel === DEFAULT_CREDENTIALS.geminiModel) {
-      window.sessionStorage.removeItem(SESSION_CREDS_KEY);
-    } else {
-      window.sessionStorage.setItem(SESSION_CREDS_KEY, JSON.stringify(creds));
-    }
-  } catch {
-    // ignore storage quota / privacy mode errors
-  }
-}
-
 const AppContext = createContext<AppContextValue | undefined>(undefined);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
@@ -95,11 +45,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [preferences, setPreferences] = useState<WorkspacePreferences>(DEFAULT_PREFERENCES);
   const [preferencesOwner, setPreferencesOwner] = useState<string | null>(null);
   const [preferencesError, setPreferencesError] = useState<string | null>(null);
-  const [credentials, setCredentials] = useState<UserApiCredentials>(loadInitialCredentials);
   const [credentialStatus, setCredentialStatus] = useState<CredentialStatus>({
     geminiVerified: null,
     githubVerified: null,
   });
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.removeItem(SESSION_CREDS_KEY);
+    } catch {
+      // Storage may be unavailable in restricted browser contexts.
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -108,8 +65,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (res.status === 401) {
           if (!cancelled) {
             setUser(null);
-            setCredentials(DEFAULT_CREDENTIALS);
-            saveSessionCredentials(DEFAULT_CREDENTIALS);
             setCredentialStatus({ geminiVerified: null, githubVerified: null });
           }
           return { user: undefined };
@@ -186,8 +141,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const setSession = useCallback((nextUser: UserProfile | null) => {
     setUser(nextUser);
     setAuthLoading(false);
-    setCredentials(DEFAULT_CREDENTIALS);
-    saveSessionCredentials(DEFAULT_CREDENTIALS);
     setCredentialStatus({ geminiVerified: null, githubVerified: null });
   }, []);
 
@@ -198,27 +151,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // Local state is cleared even if the server is unreachable.
     }
     setUser(null);
-    setCredentials(DEFAULT_CREDENTIALS);
-    saveSessionCredentials(DEFAULT_CREDENTIALS);
     setCredentialStatus({ geminiVerified: null, githubVerified: null });
   }, []);
 
   const updatePreferences = useCallback((partial: Partial<WorkspacePreferences>) => {
     setPreferences((prev) => ({ ...prev, ...partial }));
-  }, []);
-
-  const updateCredentials = useCallback((partial: Partial<UserApiCredentials>) => {
-    setCredentials((prev) => {
-      const next = { ...prev, ...partial };
-      saveSessionCredentials(next);
-      return next;
-    });
-  }, []);
-
-  const clearCredentials = useCallback(() => {
-    setCredentials(DEFAULT_CREDENTIALS);
-    saveSessionCredentials(DEFAULT_CREDENTIALS);
-    setCredentialStatus({ geminiVerified: null, githubVerified: null });
   }, []);
 
   return (
@@ -231,9 +168,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         preferences,
         updatePreferences,
         preferencesError,
-        credentials,
-        updateCredentials,
-        clearCredentials,
         credentialStatus,
         setCredentialStatus,
       }}

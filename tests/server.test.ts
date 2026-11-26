@@ -21,7 +21,7 @@ beforeAll(async () => {
   process.env.DATABASE_PATH = databasePath;
   process.env.ALLOW_SERVER_KEY = 'false';
   process.env.ALLOWED_ORIGINS = 'http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173';
-  process.env.APP_ENCRYPTION_KEY = '2'.repeat(64);
+  process.env.APP_ENCRYPTION_KEY = Buffer.alloc(32, 2).toString('base64');
   process.env.GITHUB_OAUTH_CLIENT_ID = 'oauth-client-id-for-tests';
   process.env.GITHUB_OAUTH_CLIENT_SECRET = 'oauth-client-secret-for-tests';
   process.env.GITHUB_REDIRECT_URI = 'http://localhost:3000/api/auth/github/callback';
@@ -348,6 +348,79 @@ describe('persistent owner and Gemini quota records', () => {
     expect(database.consumeGeminiDailyQuota(firstUser.id, '2026-01-01', 2)).toBe(true);
     expect(database.consumeGeminiDailyQuota(firstUser.id, '2026-01-01', 2)).toBe(true);
     expect(database.consumeGeminiDailyQuota(firstUser.id, '2026-01-01', 2)).toBe(false);
+  });
+});
+
+describe('server-side user API keys', () => {
+  it('encrypts API key values and rejects tampered ciphertext', async () => {
+    const cryptoHelpers = await import('../server/secretCrypto.ts');
+    const { redactErrorFields, redactSecrets } = await import('../server/redaction.ts');
+    const plaintext = `AIzaSy${'A'.repeat(32)}`;
+    const githubToken = `ghp_${'s'.repeat(36)}`;
+    const encrypted = cryptoHelpers.encryptUserApiKey(plaintext);
+
+    expect(encrypted.ciphertext).not.toContain(plaintext);
+    expect(cryptoHelpers.decryptUserApiKey(encrypted)).toBe(plaintext);
+    const tamperedTag = Buffer.from(encrypted.authTag, 'base64');
+    tamperedTag[0] ^= 1;
+    expect(() =>
+      cryptoHelpers.decryptUserApiKey({
+        ...encrypted,
+        authTag: tamperedTag.toString('base64'),
+      })
+    ).toThrow();
+
+    expect(cryptoHelpers.parseEncryptionKey('02'.repeat(32))).toEqual(Buffer.alloc(32, 2));
+    expect(redactSecrets(`${plaintext} ${githubToken}`)).not.toContain(plaintext);
+    expect(redactSecrets(`${plaintext} ${githubToken}`)).not.toContain(githubToken);
+    expect(redactErrorFields({ nested: { error: githubToken } })).toEqual({
+      nested: { error: '[REDACTED]' },
+    });
+  });
+
+  it('keeps saved keys encrypted, returns metadata only, and scopes use and deletion to each user', async () => {
+    const firstUser = await insertTestUser('api-key-owner@example.com');
+    const secondUser = await insertTestUser('api-key-other@example.com');
+    const firstAgent = request.agent(app);
+    const secondAgent = request.agent(app);
+    expect((await postWithCsrf(firstAgent, '/api/auth/login', {
+      email: firstUser.email,
+      password: firstUser.password,
+    })).status).toBe(200);
+    expect((await postWithCsrf(secondAgent, '/api/auth/login', {
+      email: secondUser.email,
+      password: secondUser.password,
+    })).status).toBe(200);
+
+    const secret = `ghp_${'s'.repeat(36)}`;
+    const csrf = await csrfToken(firstAgent);
+    const saved = await firstAgent
+      .put('/api/settings/keys/github')
+      .set('Origin', origin)
+      .set('X-CSRF-Token', csrf)
+      .send({ value: secret });
+    expect(saved.status).toBe(200);
+    expect(JSON.stringify(saved.body)).not.toContain(secret);
+
+    const firstKeys = await firstAgent.get('/api/settings/keys');
+    expect(firstKeys.status).toBe(200);
+    expect(firstKeys.body.keys).toEqual([
+      expect.objectContaining({ provider: 'github', last4: 'ssss' }),
+    ]);
+    expect(JSON.stringify(firstKeys.body)).not.toContain(secret);
+    expect(JSON.stringify(firstKeys.body)).not.toContain('ciphertext');
+    expect(database.getUserApiKey(secondUser.id, 'github')).toBeUndefined();
+
+    const secondKeys = await secondAgent.get('/api/settings/keys');
+    expect(secondKeys.body.keys).toEqual([]);
+    const secondCsrf = await csrfToken(secondAgent);
+    const otherDelete = await secondAgent
+      .delete('/api/settings/keys/github')
+      .set('Origin', origin)
+      .set('X-CSRF-Token', secondCsrf);
+    expect(otherDelete.status).toBe(200);
+    expect(otherDelete.body.deleted).toBe(false);
+    expect(database.getUserApiKey(firstUser.id, 'github')?.ciphertext).not.toContain(secret);
   });
 });
 

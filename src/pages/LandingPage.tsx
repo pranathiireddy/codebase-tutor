@@ -14,7 +14,7 @@ import {
 import { Link, useNavigate } from 'react-router-dom';
 import { TopNav } from '../components/TopNav';
 import { useApp } from '../context/AppContext';
-import { apiFetch, buildApiHeaders, safeJson } from '../utils/api';
+import { apiFetch, safeJson } from '../utils/api';
 import type { AnalysisStage, RepositoryRecord } from '../types/codebase';
 
 const STAGE_STEPS: { stage: AnalysisStage; label: string }[] = [
@@ -30,7 +30,7 @@ const STAGE_STEPS: { stage: AnalysisStage; label: string }[] = [
 
 export function LandingPage() {
   const navigate = useNavigate();
-  const { credentials, user } = useApp();
+  const { user } = useApp();
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const [repoUrl, setRepoUrl] = useState('');
@@ -86,24 +86,16 @@ export function LandingPage() {
       navigate('/login');
       return;
     }
-    let trimmed = repoUrl.trim();
+    const trimmed = repoUrl.trim();
     if (!trimmed) {
       setSubmitError('Enter a GitHub URL such as https://github.com/DietrichGebert/ponytail');
       return;
     }
-    if (
-      credentials.githubDefaultOwner.trim() &&
-      !trimmed.includes('/') &&
-      !trimmed.includes(':')
-    ) {
-      trimmed = `${credentials.githubDefaultOwner.trim()}/${trimmed}`;
-    }
-
     setSubmitting(true);
     try {
       const res = await apiFetch('/api/repositories/analyze', {
         method: 'POST',
-        headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: trimmed }),
       });
       const json = await safeJson<{ repository?: RepositoryRecord; error?: string }>(res);
@@ -192,11 +184,7 @@ export function LandingPage() {
               <p className="mt-1 text-xs text-[#9CA3AF]">
                 Static analysis runs safely on the server without executing repository code.{' '}
                 <Link to="/settings" className="text-sky-400 hover:text-sky-300">
-                  {user
-                    ? credentials.githubToken.trim()
-                      ? 'Using custom GitHub token'
-                      : 'Add GitHub token for private repos'
-                    : 'Log in to import repositories'}
+                  {user ? 'Configure GitHub access for private repos' : 'Log in to import repositories'}
                 </Link>
               </p>
             </div>
@@ -213,11 +201,7 @@ export function LandingPage() {
                   value={repoUrl}
                   onChange={(e) => setRepoUrl(e.target.value)}
                   disabled={!user}
-                  placeholder={
-                    credentials.githubDefaultOwner.trim()
-                      ? `repo-name (defaults to ${credentials.githubDefaultOwner.trim()}/...) or full URL`
-                      : 'https://github.com/username/repository'
-                  }
+                  placeholder="https://github.com/username/repository or owner/repository"
                   className="w-full rounded-md border border-[#232832] bg-[#0B0D10] px-3.5 py-2.5 font-mono text-xs text-[#E6E9EF] placeholder-[#6B7280] focus:border-sky-500 focus:outline-none"
                 />
               </div>

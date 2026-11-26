@@ -11,6 +11,7 @@ import {
   startDailyChatRetentionCleanup,
 } from './server/db/index.ts';
 import { initializeFeaturedDemo, startPrivateAnalysisEviction } from './server/repoStore.ts';
+import { redactSecrets } from './server/redaction.ts';
 
 export async function startServer(): Promise<void> {
   initializeDatabase();
@@ -44,7 +45,7 @@ export async function startServer(): Promise<void> {
 const invokedPath = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : undefined;
 if (invokedPath === import.meta.url) {
   void startServer().catch((err: unknown) => {
-    const message = err instanceof Error ? err.message : 'Unknown startup error.';
+    const message = redactSecrets(err instanceof Error ? err.message : 'Unknown startup error.');
     console.error(`Failed to start server: ${message}`);
     process.exitCode = 1;
   });

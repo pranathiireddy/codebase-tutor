@@ -29,7 +29,6 @@ import type {
   ChatRecord,
   CodeAttachment,
 } from '../types/codebase';
-import type { ApiCredentialHeaders } from '../utils/api';
 import {
   clearAudioCache,
   stopAllSpeech,
@@ -44,8 +43,8 @@ interface ChatPanelProps {
   messages: ChatMessage[];
   loading: boolean;
   context: ChatContext;
-  credentials?: ApiCredentialHeaders;
   hasCustomGeminiKey?: boolean;
+  keyStatusError?: string;
   onQuickApplyGeminiKey?: (apiKey: string, retryQuestion?: string) => Promise<string | null>;
   onClearAttachedCode: () => void;
   onAttachCode: (att: CodeAttachment) => void;
@@ -279,8 +278,8 @@ export function ChatPanel({
   messages,
   loading,
   context,
-  credentials,
   hasCustomGeminiKey,
+  keyStatusError,
   onQuickApplyGeminiKey,
   onClearAttachedCode,
   onAttachCode,
@@ -363,7 +362,6 @@ export function ChatPanel({
       messageId: msg.id,
       markdown: msg.content,
       mode: modeOverride ?? voiceMode,
-      credentials,
       audioRef,
       signal: controller.signal,
       onLoading: () => {
@@ -593,6 +591,9 @@ export function ChatPanel({
             Grounded in {repositoryName}
             {hasCustomGeminiKey ? ' · Custom Gemini key' : ''}
           </p>
+          {keyStatusError && (
+            <p className="text-[10px] text-amber-400">{keyStatusError}</p>
+          )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
           <button

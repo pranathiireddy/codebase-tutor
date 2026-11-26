@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { config } from '../config.ts';
+import { redactSecrets } from '../redaction.ts';
 import { runMigrations } from './migrate.ts';
 import type { DiagramType } from '../../src/types/codebase.ts';
 
@@ -50,6 +51,30 @@ export interface GithubAppInstallationRecord {
   createdAt: number;
   lastUsedAt: number | null;
   revokedAt: number | null;
+}
+
+export type UserApiKeyProvider = 'gemini' | 'github' | 'github_owner';
+
+export interface UserApiKeyRecord {
+  id: string;
+  userId: string;
+  provider: UserApiKeyProvider;
+  ciphertext: string;
+  iv: string;
+  authTag: string;
+  keyVersion: number;
+  last4: string;
+  model: string | null;
+  createdAt: number;
+  lastUsedAt: number | null;
+}
+
+export interface UserApiKeyMetadata {
+  provider: UserApiKeyProvider;
+  last4: string;
+  model: string | null;
+  createdAt: number;
+  lastUsedAt: number | null;
 }
 
 export interface SessionRecord {
@@ -546,6 +571,102 @@ export function revokeGithubAppInstallation(userId: string, installationId: stri
     UPDATE github_app_installations SET revoked_at = ?, access_token_enc = ''
     WHERE user_id = ? AND installation_id = ? AND revoked_at IS NULL
   `).run(now, userId, installationId).changes > 0;
+}
+
+function toUserApiKeyRecord(row: Record<string, unknown> | undefined): UserApiKeyRecord | undefined {
+  if (!row) return undefined;
+  return {
+    id: String(row.id),
+    userId: String(row.user_id),
+    provider: String(row.provider) as UserApiKeyProvider,
+    ciphertext: String(row.ciphertext),
+    iv: String(row.iv),
+    authTag: String(row.auth_tag),
+    keyVersion: Number(row.key_version),
+    last4: String(row.last4),
+    model: row.model == null ? null : String(row.model),
+    createdAt: Number(row.created_at),
+    lastUsedAt: row.last_used_at == null ? null : Number(row.last_used_at),
+  };
+}
+
+export function saveUserApiKey(
+  key: Pick<
+    UserApiKeyRecord,
+    'id' | 'userId' | 'provider' | 'ciphertext' | 'iv' | 'authTag' | 'keyVersion' | 'last4' | 'model'
+  >,
+  now: number
+): void {
+  getDatabase().prepare(`
+    INSERT INTO user_api_keys (
+      id, user_id, provider, ciphertext, iv, auth_tag, key_version, last4, model, created_at, last_used_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    ON CONFLICT(user_id, provider) DO UPDATE SET
+      ciphertext = excluded.ciphertext,
+      iv = excluded.iv,
+      auth_tag = excluded.auth_tag,
+      key_version = excluded.key_version,
+      last4 = excluded.last4,
+      model = excluded.model
+  `).run(
+    key.id,
+    key.userId,
+    key.provider,
+    key.ciphertext,
+    key.iv,
+    key.authTag,
+    key.keyVersion,
+    key.last4,
+    key.model,
+    now
+  );
+}
+
+export function getUserApiKey(userId: string, provider: UserApiKeyProvider): UserApiKeyRecord | undefined {
+  const row = getDatabase()
+    .prepare('SELECT * FROM user_api_keys WHERE user_id = ? AND provider = ?')
+    .get(userId, provider) as Record<string, unknown> | undefined;
+  return toUserApiKeyRecord(row);
+}
+
+export function listUserApiKeys(userId: string): UserApiKeyMetadata[] {
+  const rows = getDatabase()
+    .prepare(`
+      SELECT provider, last4, model, created_at, last_used_at
+      FROM user_api_keys
+      WHERE user_id = ?
+      ORDER BY provider
+    `)
+    .all(userId) as Record<string, unknown>[];
+  return rows.map((row) => ({
+    provider: String(row.provider) as UserApiKeyProvider,
+    last4: String(row.last4),
+    model: row.model == null ? null : String(row.model),
+    createdAt: Number(row.created_at),
+    lastUsedAt: row.last_used_at == null ? null : Number(row.last_used_at),
+  }));
+}
+
+export function markUserApiKeyUsed(userId: string, provider: UserApiKeyProvider, now: number): void {
+  getDatabase()
+    .prepare('UPDATE user_api_keys SET last_used_at = ? WHERE user_id = ? AND provider = ?')
+    .run(now, userId, provider);
+}
+
+export function updateUserApiKeyModel(
+  userId: string,
+  provider: UserApiKeyProvider,
+  model: string
+): void {
+  getDatabase()
+    .prepare('UPDATE user_api_keys SET model = ? WHERE user_id = ? AND provider = ?')
+    .run(model, userId, provider);
+}
+
+export function deleteUserApiKey(userId: string, provider: UserApiKeyProvider): boolean {
+  return getDatabase()
+    .prepare('DELETE FROM user_api_keys WHERE user_id = ? AND provider = ?')
+    .run(userId, provider).changes > 0;
 }
 
 export function recordFailedLogin(
@@ -1067,7 +1188,10 @@ export function startDailyChatRetentionCleanup(): void {
     try {
       deleteExpiredChats();
     } catch (error) {
-      console.error('Daily chat retention cleanup failed:', error);
+      console.error(
+        'Daily chat retention cleanup failed:',
+        redactSecrets(error instanceof Error ? error.message : String(error))
+      );
     }
   }, 24 * 60 * 60 * 1000);
   chatRetentionTimer.unref();

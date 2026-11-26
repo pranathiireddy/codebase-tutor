@@ -11,6 +11,12 @@ const optionalTrimmedString = z.preprocess(
   z.string().optional()
 );
 
+function isValidEncryptionKey(value: string): boolean {
+  if (/^[0-9a-f]{64}$/i.test(value)) return true;
+  const decoded = Buffer.from(value, 'base64');
+  return decoded.length === 32 && decoded.toString('base64') === value;
+}
+
 const configSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
@@ -27,7 +33,7 @@ const configSchema = z.object({
   SERVER_KEY_DAILY_CAP: z.coerce.number().int().positive().default(50),
   APP_ENCRYPTION_KEY: z.preprocess(
     (value) => (value === '' ? undefined : value),
-    z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 32-byte hexadecimal key').optional()
+    z.string().refine(isValidEncryptionKey, 'must be a 32-byte base64 key').optional()
   ),
   DATABASE_PATH: z.string().trim().min(1).default('.codebase-tutor-cache/codebase-tutor.sqlite'),
   ALLOWED_ORIGINS: z
