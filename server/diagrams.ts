@@ -372,7 +372,7 @@ function buildDataFlowDiagram(
   };
 }
 
-function buildSequenceDiagram(
+export function buildSequenceDiagram(
   repositoryId: string,
   analysis: AnalysisResult,
   graph: KnowledgeGraph
@@ -474,14 +474,22 @@ function buildSequenceDiagram(
       confidence: 'inferred',
     });
 
-    const sanitize = (s: string) => s.replace(/[^A-Za-z0-9_]/g, '_');
+    const participantIds = new Map<string, string>();
+    Array.from(participants).forEach((participant, index) => {
+      participantIds.set(participant, `participant_${index}`);
+    });
+    const getParticipantId = (participant: string) => {
+      const id = participantIds.get(participant);
+      if (!id) throw new Error(`Missing sequence participant: ${participant}`);
+      return id;
+    };
     const mermaidLines = ['sequenceDiagram'];
     for (const p of participants) {
-      mermaidLines.push(`  participant ${sanitize(p)} as ${p}`);
+      mermaidLines.push(`  participant ${getParticipantId(p)} as ${p}`);
     }
     for (const st of steps) {
       const arrow = st.type === 'return' ? '-->>' : '->>';
-      mermaidLines.push(`  ${sanitize(st.from)}${arrow}${sanitize(st.to)}: ${st.message}`);
+      mermaidLines.push(`  ${getParticipantId(st.from)}${arrow}${getParticipantId(st.to)}: ${st.message}`);
     }
 
     scenarios.push({

@@ -19,12 +19,14 @@ import {
   AlertCircle,
   CheckCircle2,
   HelpCircle,
+  ChevronLeft,
   ChevronRight,
   Route,
   GripVertical,
   Info,
   Download,
 } from 'lucide-react';
+import mermaid from 'mermaid';
 import type {
   DiagramPayload,
   DiagramType,
@@ -110,6 +112,245 @@ const nodeTypes = {
   archNode: ArchitectureNode,
 };
 
+let exportRenderId = 0;
+
+function getSvgDimensions(svgMarkup: string) {
+  const parsedSvg = new DOMParser().parseFromString(svgMarkup, 'image/svg+xml');
+  const root = parsedSvg.documentElement;
+  if (root.tagName.toLowerCase() !== 'svg' || parsedSvg.querySelector('parsererror')) {
+    throw new Error('The rendered diagram is not valid SVG.');
+  }
+
+  const viewBox = root
+    .getAttribute('viewBox')
+    ?.trim()
+    .split(/[\s,]+/)
+    .map(Number);
+  const getDimension = (attribute: string, fallback: number) => {
+    const value = root.getAttribute(attribute) ?? '';
+    return /^\s*\d+(?:\.\d+)?(?:px)?\s*$/.test(value) ? Number.parseFloat(value) : fallback;
+  };
+  const width = Math.max(1, viewBox?.[2] || getDimension('width', 1200));
+  const height = Math.max(1, viewBox?.[3] || getDimension('height', 800));
+
+  root.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  root.setAttribute('width', String(width));
+  root.setAttribute('height', String(height));
+
+  return {
+    svg: new XMLSerializer().serializeToString(root),
+    width,
+    height,
+  };
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function addSvgElement(
+  parent: SVGElement,
+  name: string,
+  attributes: Record<string, string>,
+  text?: string
+) {
+  const element = document.createElementNS('http://www.w3.org/2000/svg', name);
+  Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, value));
+  if (text !== undefined) element.textContent = text;
+  parent.appendChild(element);
+  return element;
+}
+
+function createGraphSvg(diagram: DiagramPayload) {
+  const nodeWidth = 220;
+  const nodeHeight = 84;
+  const padding = 48;
+  if (diagram.nodes.length === 0) {
+    const width = 960;
+    const height = 280;
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    svg.setAttribute('width', String(width));
+    svg.setAttribute('height', String(height));
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    addSvgElement(svg, 'rect', { width: String(width), height: String(height), fill: '#0F1217' });
+    addSvgElement(svg, 'text', {
+      x: String(width / 2),
+      y: '104',
+      fill: '#E6E9EF',
+      'font-family': 'Arial, sans-serif',
+      'font-size': '20',
+      'font-weight': '600',
+      'text-anchor': 'middle',
+    }, diagram.title);
+
+    const message = diagram.availabilityNote || diagram.summary;
+    const words = message.split(/\s+/);
+    const lines: string[] = [];
+    let line = '';
+    words.forEach((word) => {
+      if (line && `${line} ${word}`.length > 96) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = line ? `${line} ${word}` : word;
+      }
+    });
+    if (line) lines.push(line);
+    lines.forEach((text, index) => {
+      addSvgElement(svg, 'text', {
+        x: String(width / 2),
+        y: String(145 + index * 24),
+        fill: '#9CA3AF',
+        'font-family': 'Arial, sans-serif',
+        'font-size': '14',
+        'text-anchor': 'middle',
+      }, text);
+    });
+    return { svg: new XMLSerializer().serializeToString(svg), width, height };
+  }
+
+  const minX = Math.min(...diagram.nodes.map((node) => node.x));
+  const minY = Math.min(...diagram.nodes.map((node) => node.y));
+  const maxX = Math.max(...diagram.nodes.map((node) => node.x + nodeWidth));
+  const maxY = Math.max(...diagram.nodes.map((node) => node.y + nodeHeight));
+  const width = Math.ceil(maxX - minX + padding * 2);
+  const height = Math.ceil(maxY - minY + padding * 2);
+  const offsetNode = (node: DiagramVisualNode) => ({
+    x: node.x - minX + padding,
+    y: node.y - minY + padding,
+  });
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  svg.setAttribute('width', String(width));
+  svg.setAttribute('height', String(height));
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+  addSvgElement(svg, 'rect', { width: String(width), height: String(height), fill: '#0F1217' });
+
+  const defs = addSvgElement(svg, 'defs', {});
+  const edgeColors = { verified: '#64748B', inferred: '#D97706', uncertain: '#9CA3AF' };
+  Object.entries(edgeColors).forEach(([confidence, color]) => {
+    const marker = addSvgElement(defs, 'marker', {
+      id: `arrow-${confidence}`,
+      markerWidth: '8',
+      markerHeight: '8',
+      refX: '7',
+      refY: '4',
+      orient: 'auto',
+      markerUnits: 'strokeWidth',
+    });
+    addSvgElement(marker, 'path', { d: 'M 0 0 L 8 4 L 0 8 z', fill: color });
+  });
+
+  const nodeMap = new Map(diagram.nodes.map((node) => [node.id, node]));
+  diagram.edges.forEach((edge) => {
+    const source = nodeMap.get(edge.source);
+    const target = nodeMap.get(edge.target);
+    if (!source || !target) return;
+
+    const sourcePosition = offsetNode(source);
+    const targetPosition = offsetNode(target);
+    const startX = sourcePosition.x + nodeWidth / 2;
+    const startY = sourcePosition.y + nodeHeight;
+    const endX = targetPosition.x + nodeWidth / 2;
+    const endY = targetPosition.y;
+    const middleY = (startY + endY) / 2;
+    const color = edgeColors[edge.confidence] ?? edgeColors.verified;
+    addSvgElement(svg, 'path', {
+      d: `M ${startX} ${startY} L ${startX} ${middleY} L ${endX} ${middleY} L ${endX} ${endY}`,
+      fill: 'none',
+      stroke: color,
+      'stroke-width': '1.5',
+      ...(edge.confidence === 'inferred' ? { 'stroke-dasharray': '5 4' } : {}),
+      'marker-end': `url(#arrow-${edge.confidence in edgeColors ? edge.confidence : 'verified'})`,
+    });
+  });
+
+  diagram.nodes.forEach((node) => {
+    const position = offsetNode(node);
+    const categoryColor =
+      node.category === 'file'
+        ? '#38BDF8'
+        : node.category === 'module'
+          ? '#A5B4FC'
+          : node.category === 'api'
+            ? '#34D399'
+            : node.category === 'workflow'
+              ? '#FBBF24'
+              : node.category === 'class'
+                ? '#C4B5FD'
+                : '#9CA3AF';
+    const group = addSvgElement(svg, 'g', {});
+    addSvgElement(group, 'rect', {
+      x: String(position.x),
+      y: String(position.y),
+      width: String(nodeWidth),
+      height: String(nodeHeight),
+      rx: '8',
+      fill: '#141820',
+      stroke: '#262C38',
+      'stroke-width': '1.5',
+    });
+    addSvgElement(group, 'circle', {
+      cx: String(position.x + nodeWidth / 2),
+      cy: String(position.y),
+      r: '4',
+      fill: '#60A5FA',
+    });
+    addSvgElement(group, 'circle', {
+      cx: String(position.x + nodeWidth / 2),
+      cy: String(position.y + nodeHeight),
+      r: '4',
+      fill: '#60A5FA',
+    });
+    addSvgElement(group, 'text', {
+      x: String(position.x + 12),
+      y: String(position.y + 20),
+      fill: categoryColor,
+      'font-family': 'Arial, sans-serif',
+      'font-size': '10',
+      'font-weight': '600',
+    }, node.category.toUpperCase());
+    if (node.confidence !== 'verified') {
+      addSvgElement(group, 'text', {
+        x: String(position.x + nodeWidth - 12),
+        y: String(position.y + 20),
+        fill: '#FBBF24',
+        'font-family': 'Arial, sans-serif',
+        'font-size': '10',
+        'text-anchor': 'end',
+      }, node.confidence);
+    }
+    addSvgElement(group, 'text', {
+      x: String(position.x + 12),
+      y: String(position.y + 44),
+      fill: '#F3F4F6',
+      'font-family': 'Arial, sans-serif',
+      'font-size': '13',
+      'font-weight': '600',
+    }, node.label.length > 28 ? `${node.label.slice(0, 25)}...` : node.label);
+    if (node.sublabel) {
+      addSvgElement(group, 'text', {
+        x: String(position.x + 12),
+        y: String(position.y + 64),
+        fill: '#9CA3AF',
+        'font-family': 'Arial, sans-serif',
+        'font-size': '11',
+      }, node.sublabel.length > 30 ? `${node.sublabel.slice(0, 27)}...` : node.sublabel);
+    }
+  });
+
+  return { svg: new XMLSerializer().serializeToString(svg), width, height };
+}
+
 function ConfidenceLabel({ level }: { level: 'verified' | 'inferred' | 'uncertain' }) {
   if (level === 'verified') {
     return (
@@ -158,85 +399,85 @@ export function DiagramExplorerPanel({
   const [showGraphHelp, setShowGraphHelp] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
 
-  const handleExportPng = () => {
-    setShowExportMenu(false);
-    const svgEl = document.querySelector('.react-flow__renderer svg, .w-full.overflow-auto svg, svg') as SVGElement | null;
-    if (!svgEl) {
-      alert('Diagram SVG is not currently rendered in view.');
-      return;
+  const renderExportSvg = async () => {
+    if (!diagram) {
+      throw new Error('The diagram is not available for export.');
     }
-    const clone = svgEl.cloneNode(true) as SVGElement;
-    if (!clone.getAttribute('xmlns')) {
-      clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    const code =
+      viewMode === 'mermaid' && diagram.mermaidCode
+        ? activeDiagramType === 'sequence'
+          ? activeScenario?.mermaidCode ?? diagram.mermaidCode
+          : diagram.mermaidCode
+        : undefined;
+    if (code) {
+      const { svg } = await mermaid.render(`diagram-export-${++exportRenderId}`, code);
+      return getSvgDimensions(svg);
     }
-    const rect = svgEl.getBoundingClientRect();
-    const width = rect.width || 1200;
-    const height = rect.height || 800;
-    clone.setAttribute('width', String(width));
-    clone.setAttribute('height', String(height));
-
-    const svgData = new XMLSerializer().serializeToString(clone);
-    const svg64 = btoa(unescape(encodeURIComponent(svgData)));
-    const imageSrc = `data:image/svg+xml;base64,${svg64}`;
-
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = width * 2;
-      canvas.height = height * 2;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      ctx.fillStyle = '#0F1217';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.scale(2, 2);
-      ctx.drawImage(img, 0, 0, width, height);
-
-      const pngUrl = canvas.toDataURL('image/png');
-      const link = document.createElement('a');
-      link.href = pngUrl;
-      link.download = `${activeDiagramType}-${repositoryId}.png`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-    };
-    img.src = imageSrc;
+    return createGraphSvg(diagram);
   };
 
-  const handleExportSvg = () => {
+  const getExportFilename = (extension: string) => {
+    const safeRepositoryId = repositoryId.replace(/[^a-z0-9._-]+/gi, '-');
+    return `${activeDiagramType}-${safeRepositoryId}.${extension}`;
+  };
+
+  const handleExportPng = async () => {
     setShowExportMenu(false);
-    const svgEl = document.querySelector('.react-flow__renderer svg, .w-full.overflow-auto svg, svg') as SVGElement | null;
-    if (!svgEl) {
-      alert('Diagram SVG is not currently rendered in view.');
-      return;
+    try {
+      const { svg, width, height } = await renderExportSvg();
+      const imageUrl = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }));
+      const image = new Image();
+      image.onerror = () => {
+        URL.revokeObjectURL(imageUrl);
+        alert('Unable to render the diagram image for export.');
+      };
+      image.onload = () => {
+        try {
+          const scale = 2;
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.ceil(width * scale);
+          canvas.height = Math.ceil(height * scale);
+          const context = canvas.getContext('2d');
+          if (!context) {
+            throw new Error('Your browser could not create an image canvas.');
+          }
+          context.fillStyle = '#0F1217';
+          context.fillRect(0, 0, canvas.width, canvas.height);
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          canvas.toBlob((blob) => {
+            if (blob) {
+              downloadBlob(blob, getExportFilename('png'));
+            } else {
+              alert('Your browser could not create a PNG image from this diagram.');
+            }
+          }, 'image/png');
+        } catch (err) {
+          alert(err instanceof Error ? err.message : 'Unable to export the diagram as PNG.');
+        } finally {
+          URL.revokeObjectURL(imageUrl);
+        }
+      };
+      image.src = imageUrl;
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Unable to export the diagram as PNG.');
     }
-    const clone = svgEl.cloneNode(true) as SVGElement;
-    if (!clone.getAttribute('xmlns')) {
-      clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  };
+
+  const handleExportSvg = async () => {
+    setShowExportMenu(false);
+    try {
+      const { svg } = await renderExportSvg();
+      downloadBlob(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }), getExportFilename('svg'));
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Unable to export the diagram as SVG.');
     }
-    const svgData = new XMLSerializer().serializeToString(clone);
-    const blob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${activeDiagramType}-${repositoryId}.svg`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
   };
 
   const handleExportJson = () => {
     setShowExportMenu(false);
     if (!diagram) return;
     const blob = new Blob([JSON.stringify(diagram, null, 2)], { type: 'application/json;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${activeDiagramType}-${repositoryId}.json`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    downloadBlob(blob, getExportFilename('json'));
   };
 
   useEffect(() => {
@@ -245,6 +486,7 @@ export function DiagramExplorerPanel({
       setLoading(true);
       setError(null);
       setSelectedEdge(null);
+      setSelectedNode(null);
       setExpandedNodeDetails(null);
       setActiveScenarioIdx(0);
       try {
@@ -255,15 +497,6 @@ export function DiagramExplorerPanel({
         }
         if (!cancelled) {
           setDiagram(json.diagram);
-          // Cross-diagram sync: match selectedGraphNodeId if present in this diagram
-          if (selectedGraphNodeId) {
-            const match = json.diagram.nodes.find(
-              (n) => n.graphNodeId === selectedGraphNodeId || n.id === selectedGraphNodeId
-            );
-            setSelectedNode(match ?? null);
-          } else {
-            setSelectedNode(null);
-          }
         }
       } catch (err) {
         if (!cancelled) {
@@ -277,7 +510,15 @@ export function DiagramExplorerPanel({
     return () => {
       cancelled = true;
     };
-  }, [repositoryId, activeDiagramType, selectedGraphNodeId]);
+  }, [repositoryId, activeDiagramType]);
+
+  useEffect(() => {
+    if (!diagram) return;
+    const match = selectedGraphNodeId
+      ? diagram.nodes.find((node) => node.graphNodeId === selectedGraphNodeId || node.id === selectedGraphNodeId)
+      : null;
+    setSelectedNode(match ?? null);
+  }, [diagram, selectedGraphNodeId]);
 
   const handleSelectNode = async (visualNode: DiagramVisualNode) => {
     setSelectedNode(visualNode);
@@ -390,6 +631,39 @@ export function DiagramExplorerPanel({
   }, [diagram, selectedEdge, selectedNode, connectedNodeIds]);
 
   const activeScenario = diagram?.scenarios?.[activeScenarioIdx];
+  const selectedNodeIndex =
+    diagram && selectedNode ? diagram.nodes.findIndex((node) => node.id === selectedNode.id) : -1;
+  const navigateSelectedNode = (direction: -1 | 1) => {
+    if (!diagram || selectedNodeIndex < 0) return;
+    const nextNode = diagram.nodes[selectedNodeIndex + direction];
+    if (nextNode) void handleSelectNode(nextNode);
+  };
+
+  useEffect(() => {
+    if (!selectedNode || selectedNodeIndex < 0) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable || target.closest('input, textarea, select, [contenteditable="true"]'))
+      ) {
+        return;
+      }
+
+      if (event.key === 'ArrowLeft' && selectedNodeIndex > 0) {
+        event.preventDefault();
+        navigateSelectedNode(-1);
+      } else if (event.key === 'ArrowRight' && diagram && selectedNodeIndex < diagram.nodes.length - 1) {
+        event.preventDefault();
+        navigateSelectedNode(1);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [diagram, navigateSelectedNode, selectedNode, selectedNodeIndex]);
 
   return (
     <div className="flex h-full flex-col bg-[#0B0D10]">
@@ -720,6 +994,31 @@ export function DiagramExplorerPanel({
                   {selectedNode.sublabel && (
                     <p className="text-xs text-[#9CA3AF] mt-0.5">{selectedNode.sublabel}</p>
                   )}
+                  <div className="mt-3 flex items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      onClick={() => navigateSelectedNode(-1)}
+                      disabled={selectedNodeIndex <= 0}
+                      aria-label="Previous node"
+                      className="flex items-center gap-1 rounded border border-[#232832] px-2 py-1 text-[11px] text-[#D1D5DB] hover:border-sky-500/50 hover:text-[#F3F4F6] disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <ChevronLeft className="h-3 w-3" />
+                      Previous
+                    </button>
+                    <span className="text-[10px] tabular-nums text-[#6B7280]">
+                      {selectedNodeIndex + 1} / {diagram?.nodes.length ?? 0}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => navigateSelectedNode(1)}
+                      disabled={!diagram || selectedNodeIndex < 0 || selectedNodeIndex >= diagram.nodes.length - 1}
+                      aria-label="Next node"
+                      className="flex items-center gap-1 rounded border border-[#232832] px-2 py-1 text-[11px] text-[#D1D5DB] hover:border-sky-500/50 hover:text-[#F3F4F6] disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Next
+                      <ChevronRight className="h-3 w-3" />
+                    </button>
+                  </div>
                 </div>
 
                 <p className="text-xs leading-relaxed text-[#D1D5DB]">

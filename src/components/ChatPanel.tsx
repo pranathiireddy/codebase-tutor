@@ -14,6 +14,9 @@ import {
   VolumeX,
   Square,
   Loader2,
+  PanelLeftClose,
+  Mic,
+  MicOff,
 } from 'lucide-react';
 import type {
   ChatCitation,
@@ -32,6 +35,7 @@ import {
 
 interface ChatPanelProps {
   repositoryName: string;
+  onCollapse: () => void;
   messages: ChatMessage[];
   loading: boolean;
   context: ChatContext;
@@ -55,6 +59,39 @@ const STARTER_QUESTIONS = [
 
 const BARE_FILE_REF_RE =
   /((?:[a-zA-Z0-9_.-]+\/)*[a-zA-Z0-9_-]+\.(?:tsx|ts|jsx|js|mjs|cjs|py|json|yml|yaml|md|css|html|sql|sh|ps1|txt|toml|lock)(?::L?\d+(?:[-–]L?\d+)?)?)/g;
+
+interface SpeechRecognitionResultLike {
+  readonly isFinal: boolean;
+  readonly length: number;
+  readonly [index: number]: { readonly transcript: string };
+}
+
+interface SpeechRecognitionEventLike {
+  readonly resultIndex: number;
+  readonly results: { readonly length: number; readonly [index: number]: SpeechRecognitionResultLike };
+}
+
+interface SpeechRecognitionErrorEventLike {
+  readonly error: string;
+}
+
+interface SpeechRecognitionLike {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+}
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+type SpeechRecognitionWindow = Window & {
+  SpeechRecognition?: SpeechRecognitionConstructor;
+  webkitSpeechRecognition?: SpeechRecognitionConstructor;
+};
 
 function renderCodeChip(
   codeText: string,
@@ -221,6 +258,7 @@ function SafeMarkdownBody({
 
 export function ChatPanel({
   repositoryName,
+  onCollapse,
   messages,
   loading,
   context,
@@ -245,8 +283,12 @@ export function ChatPanel({
   const [speechState, setSpeechState] = useState<'idle' | 'loading' | 'playing'>('idle');
   const [speechEngineLabel, setSpeechEngineLabel] = useState<string>('');
   const [traceNotice, setTraceNotice] = useState<string | null>(null);
+  const [isListening, setIsListening] = useState(false);
+  const [interimTranscript, setInterimTranscript] = useState('');
+  const [voiceInputError, setVoiceInputError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const dragDepthRef = useRef(0);
   const traceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -350,6 +392,13 @@ export function ChatPanel({
     return () => {
       window.removeEventListener('dragend', resetDrag);
       if (traceTimerRef.current) clearTimeout(traceTimerRef.current);
+      if (recognitionRef.current) {
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.abort();
+        recognitionRef.current = null;
+      }
       abortControllerRef.current?.abort();
       playbackHandleRef.current?.stop();
       stopAllSpeech(audioRef.current);
@@ -360,8 +409,79 @@ export function ChatPanel({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || loading) return;
+    if (recognitionRef.current) {
+      recognitionRef.current.onresult = null;
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+      setIsListening(false);
+      setInterimTranscript('');
+    }
     onSendMessage(input.trim());
     setInput('');
+  };
+
+  const startVoiceInput = () => {
+    const speechWindow = window as SpeechRecognitionWindow;
+    const Recognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+    if (!Recognition) {
+      setVoiceInputError('Voice input is not supported by this browser.');
+      return;
+    }
+
+    setVoiceInputError(null);
+    setInterimTranscript('');
+    try {
+      const recognition = new Recognition();
+      recognition.lang = navigator.language || 'en-US';
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.onresult = (event) => {
+        let finalText = '';
+        let interimText = '';
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const result = event.results[i];
+          const transcript = result[0]?.transcript ?? '';
+          if (result.isFinal) finalText += transcript;
+          else interimText += transcript;
+        }
+        setInterimTranscript(interimText.trim());
+        if (finalText.trim()) {
+          setInput((current) => `${current.trimEnd()}${current.trim() ? ' ' : ''}${finalText.trim()}`);
+        }
+      };
+      recognition.onerror = (event) => {
+        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+          setVoiceInputError('Microphone access was denied. Allow microphone access in your browser settings.');
+        } else if (event.error === 'no-speech') {
+          setVoiceInputError('No speech was detected. Try speaking again.');
+        } else if (event.error !== 'aborted') {
+          setVoiceInputError('Voice input failed. Check your microphone and try again.');
+        }
+      };
+      recognition.onend = () => {
+        if (recognitionRef.current === recognition) recognitionRef.current = null;
+        setIsListening(false);
+        setInterimTranscript('');
+      };
+      recognitionRef.current = recognition;
+      recognition.start();
+      setIsListening(true);
+    } catch (error) {
+      recognitionRef.current = null;
+      setIsListening(false);
+      setVoiceInputError(
+        error instanceof Error ? `Unable to start voice input: ${error.message}` : 'Unable to start voice input.'
+      );
+    }
+  };
+
+  const toggleVoiceInput = () => {
+    setVoiceInputError(null);
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      return;
+    }
+    startVoiceInput();
   };
 
   const hasSnippetPayload = (dt: DataTransfer | null): boolean =>
@@ -433,6 +553,15 @@ export function ChatPanel({
           </p>
         </div>
         <div className="flex items-center gap-1 shrink-0">
+          <button
+            type="button"
+            onClick={onCollapse}
+            title="Collapse Tutor Chat"
+            aria-label="Collapse Tutor Chat"
+            className="rounded p-1 text-[#6B7280] hover:bg-[#1A1F28] hover:text-[#E6E9EF] cursor-pointer"
+          >
+            <PanelLeftClose className="h-3.5 w-3.5" />
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -801,8 +930,22 @@ export function ChatPanel({
                 ? 'Drop code block here to attach...'
                 : 'Ask about this repo, file, function, or drag code here...'
             }
-            className="w-full resize-none rounded-md border border-[#232832] bg-[#0B0D10] py-2 pl-3 pr-10 text-xs text-[#E6E9EF] placeholder-[#6B7280] focus:border-sky-500/60 focus:outline-none"
+            className="w-full resize-none rounded-md border border-[#232832] bg-[#0B0D10] py-2 pl-3 pr-20 text-xs text-[#E6E9EF] placeholder-[#6B7280] focus:border-sky-500/60 focus:outline-none"
           />
+          <button
+            type="button"
+            onClick={toggleVoiceInput}
+            aria-label={isListening ? 'Stop voice input' : 'Start voice input'}
+            aria-pressed={isListening}
+            title={isListening ? 'Stop voice input' : 'Start voice input'}
+            className={`absolute bottom-2 right-10 rounded p-1.5 transition-colors cursor-pointer ${
+              isListening
+                ? 'bg-rose-500/20 text-rose-300 hover:bg-rose-500/30'
+                : 'text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-[#E6E9EF]'
+            }`}
+          >
+            {isListening ? <MicOff className="h-3.5 w-3.5" /> : <Mic className="h-3.5 w-3.5" />}
+          </button>
           <button
             type="submit"
             disabled={loading || !input.trim()}
@@ -812,6 +955,16 @@ export function ChatPanel({
             <Send className="h-3.5 w-3.5" />
           </button>
         </div>
+        {isListening && (
+          <p role="status" className="mt-1.5 text-[11px] text-sky-300">
+            Listening{interimTranscript ? `: ${interimTranscript}` : '...'}
+          </p>
+        )}
+        {voiceInputError && (
+          <p role="alert" className="mt-1.5 text-[11px] text-rose-300">
+            {voiceInputError}
+          </p>
+        )}
       </form>
     </div>
   );

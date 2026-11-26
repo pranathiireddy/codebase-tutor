@@ -10,6 +10,9 @@ import {
   Loader2,
   AlertCircle,
   ExternalLink,
+  Files,
+  MessageSquare,
+  Settings,
 } from 'lucide-react';
 import { ChatPanel } from '../components/ChatPanel';
 import { FileExplorerPanel } from '../components/FileExplorerPanel';
@@ -78,6 +81,9 @@ export function WorkspacePage() {
   // Resizable panel widths (percentages)
   const [leftWidth, setLeftWidth] = useState(26);
   const [midWidth, setMidWidth] = useState(20);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
+  const [filesCollapsed, setFilesCollapsed] = useState(false);
+  const hasCollapsedPanels = chatCollapsed || filesCollapsed;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const draggingDivider = useRef<'left' | 'mid' | null>(null);
 
@@ -93,10 +99,12 @@ export function WorkspacePage() {
         const rect = containerRef.current.getBoundingClientRect();
         if (rect.width <= 0) return;
         const pct = ((clientX - rect.left) / rect.width) * 100;
+        const railWidthPct = hasCollapsedPanels ? (44 / rect.width) * 100 : 0;
         if (draggingDivider.current === 'left') {
-          setLeftWidth(Math.min(42, Math.max(18, pct)));
+          setLeftWidth(Math.min(42, Math.max(18, pct - railWidthPct)));
         } else {
-          const nextMid = pct - leftWidth;
+          const chatWidthPct = chatCollapsed ? 0 : leftWidth;
+          const nextMid = pct - railWidthPct - chatWidthPct;
           setMidWidth(Math.min(34, Math.max(14, nextMid)));
         }
       });
@@ -115,7 +123,7 @@ export function WorkspacePage() {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
     };
-  }, [leftWidth]);
+  }, [chatCollapsed, hasCollapsedPanels, leftWidth]);
 
   // Load repository list
   const loadRepoList = useCallback(async () => {
@@ -1023,56 +1031,103 @@ export function WorkspacePage() {
         </div>
       ) : (
         <div ref={containerRef} className="flex flex-1 min-h-0 overflow-hidden select-text">
+          {hasCollapsedPanels && (
+            <div className="flex h-full w-11 shrink-0 flex-col items-center gap-1 border-r border-[#232832] bg-[#111419] py-2">
+              {chatCollapsed && (
+                <button
+                  type="button"
+                  onClick={() => setChatCollapsed(false)}
+                  title="Expand Tutor Chat"
+                  aria-label="Expand Tutor Chat"
+                  aria-expanded={false}
+                  className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300 cursor-pointer"
+                >
+                  <MessageSquare className="h-4 w-4" />
+                </button>
+              )}
+              {filesCollapsed && (
+                <button
+                  type="button"
+                  onClick={() => setFilesCollapsed(false)}
+                  title="Expand File Explorer"
+                  aria-label="Expand File Explorer"
+                  aria-expanded={false}
+                  className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300 cursor-pointer"
+                >
+                  <Files className="h-4 w-4" />
+                </button>
+              )}
+              <Link
+                to="/settings"
+                title="Settings"
+                aria-label="Settings"
+                className="mt-auto rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
+              >
+                <Settings className="h-4 w-4" />
+              </Link>
+            </div>
+          )}
+
           {/* Panel A: Chat */}
-          <div style={{ width: `${leftWidth}%` }} className="h-full min-w-[240px] shrink-0">
-            <ChatPanel
-              repositoryName={repository.name}
-              messages={messages}
-              loading={chatLoading}
-              context={currentChatContext}
-              credentials={credentials}
-              hasCustomGeminiKey={Boolean(credentials.geminiApiKey.trim())}
-              onQuickApplyGeminiKey={handleQuickApplyGeminiKey}
-              onClearAttachedCode={() => setAttachedCode(undefined)}
-              onAttachCode={(att) => void handleAttachCode(att)}
-              onSendMessage={(q) => void sendQuestion(q)}
-              onClearChat={() => setMessages([])}
-              onOpenCitation={(fp, s, e) => openCodeLocation(fp, s, e)}
-              onTraceCode={handleTraceCode}
-            />
-          </div>
+          {!chatCollapsed && (
+            <div style={{ width: `${leftWidth}%` }} className="h-full min-w-[240px] shrink-0">
+              <ChatPanel
+                repositoryName={repository.name}
+                onCollapse={() => setChatCollapsed(true)}
+                messages={messages}
+                loading={chatLoading}
+                context={currentChatContext}
+                credentials={credentials}
+                hasCustomGeminiKey={Boolean(credentials.geminiApiKey.trim())}
+                onQuickApplyGeminiKey={handleQuickApplyGeminiKey}
+                onClearAttachedCode={() => setAttachedCode(undefined)}
+                onAttachCode={(att) => void handleAttachCode(att)}
+                onSendMessage={(q) => void sendQuestion(q)}
+                onClearChat={() => setMessages([])}
+                onOpenCitation={(fp, s, e) => openCodeLocation(fp, s, e)}
+                onTraceCode={handleTraceCode}
+              />
+            </div>
+          )}
 
           {/* Resize Handle 1 */}
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            onMouseDown={() => {
-              draggingDivider.current = 'left';
-            }}
-            className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-sky-500/40 transition-colors"
-          />
+          {!chatCollapsed && (
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              onMouseDown={() => {
+                draggingDivider.current = 'left';
+              }}
+              className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-sky-500/40 transition-colors"
+            />
+          )}
 
           {/* Panel B: File Explorer */}
-          <div style={{ width: `${midWidth}%` }} className="h-full min-w-[200px] shrink-0">
-            <FileExplorerPanel
-              tree={tree}
-              filesMeta={filesMeta}
-              selectedFilePath={selectedFilePath}
-              onSelectFile={handleSelectFile}
-              incomingDeps={fileData?.incomingDependencies ?? []}
-              outgoingDeps={fileData?.outgoingDependencies ?? []}
-            />
-          </div>
+          {!filesCollapsed && (
+            <div style={{ width: `${midWidth}%` }} className="h-full min-w-[200px] shrink-0">
+              <FileExplorerPanel
+                tree={tree}
+                filesMeta={filesMeta}
+                selectedFilePath={selectedFilePath}
+                onSelectFile={handleSelectFile}
+                onCollapse={() => setFilesCollapsed(true)}
+                incomingDeps={fileData?.incomingDependencies ?? []}
+                outgoingDeps={fileData?.outgoingDependencies ?? []}
+              />
+            </div>
+          )}
 
           {/* Resize Handle 2 */}
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            onMouseDown={() => {
-              draggingDivider.current = 'mid';
-            }}
-            className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-sky-500/40 transition-colors"
-          />
+          {!filesCollapsed && (
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              onMouseDown={() => {
+                draggingDivider.current = 'mid';
+              }}
+              className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-sky-500/40 transition-colors"
+            />
+          )}
 
           {/* Panel C: Code & Visual Exploration */}
           <div className="flex-1 h-full min-w-[360px]">

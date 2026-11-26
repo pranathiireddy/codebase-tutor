@@ -7,7 +7,7 @@ import {
 } from './github.ts';
 import { analyzeRepositoryFiles, type AnalysisResult } from './analyzer.ts';
 import { buildKnowledgeGraph } from './graph.ts';
-import { generateAllDiagrams, generateWalkthrough } from './diagrams.ts';
+import { buildSequenceDiagram, generateAllDiagrams, generateWalkthrough } from './diagrams.ts';
 import type {
   AnalysisStage,
   DiagramPayload,
@@ -269,8 +269,10 @@ export function initializeFeaturedDemo(): void {
           const parsed = JSON.parse(raw) as AnalyzedRepoData;
           if (parsed?.record?.id && parsed.record.stage === 'ready') {
             parsed.record.fromCache = true;
+            parsed.diagrams.sequence = buildSequenceDiagram(parsed.record.id, parsed.analysis, parsed.graph);
             repoStore.set(parsed.record.id, parsed);
             recordStore.set(parsed.record.id, parsed.record);
+            saveToDiskCache(parsed);
           }
         } catch {
           // ignore corrupted cache entry

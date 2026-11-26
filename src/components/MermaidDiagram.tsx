@@ -5,6 +5,8 @@ mermaid.initialize({
   startOnLoad: false,
   theme: 'dark',
   securityLevel: 'strict',
+  htmlLabels: false,
+  suppressErrorRendering: true,
   themeVariables: {
     darkMode: true,
     background: '#0F1217',

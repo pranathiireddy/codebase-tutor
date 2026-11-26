@@ -13,10 +13,12 @@ import {
   PlayCircle,
   ArrowDownLeft,
   ArrowUpRight,
+  PanelLeftClose,
 } from 'lucide-react';
 import type { AnalyzedFileMeta, FileRole, FileTreeNode, GraphEdgeType } from '../types/codebase';
 
 interface FileExplorerPanelProps {
+  onCollapse: () => void;
   tree: FileTreeNode[];
   filesMeta: AnalyzedFileMeta[];
   selectedFilePath: string | null;
@@ -135,6 +137,7 @@ function TreeBranch({
 }
 
 export function FileExplorerPanel({
+  onCollapse,
   tree,
   filesMeta,
   selectedFilePath,
@@ -188,9 +191,20 @@ export function FileExplorerPanel({
       <div className="border-b border-[#232832] px-3 py-2.5">
         <div className="flex items-center justify-between mb-2">
           <h2 className="text-xs font-semibold text-[#E6E9EF]">File Explorer</h2>
-          <span className="font-mono text-[11px] tabular-nums text-[#6B7280]">
-            {filesMeta.length} files
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[11px] tabular-nums text-[#6B7280]">
+              {filesMeta.length} files
+            </span>
+            <button
+              type="button"
+              onClick={onCollapse}
+              title="Collapse File Explorer"
+              aria-label="Collapse File Explorer"
+              className="rounded p-1 text-[#6B7280] hover:bg-[#1A1F28] hover:text-[#E6E9EF] cursor-pointer"
+            >
+              <PanelLeftClose className="h-3.5 w-3.5" />
+            </button>
+          </div>
         </div>
 
         {/* Search input */}
