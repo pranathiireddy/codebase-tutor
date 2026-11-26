@@ -15,17 +15,35 @@ interface GeminiClientEntry {
 const CLIENT_CACHE_LIMIT = 16;
 const CLIENT_CACHE_TTL_MS = 5 * 60 * 1000;
 const REJECTION_TTL_MS = 30 * 60 * 1000;
+const GEMINI_VERIFICATION_TIMEOUT_MS = 15000;
+const MAX_GEMINI_VERIFICATION_MODELS = 3;
 const clientCache = new Map<string, GeminiClientEntry>();
 const rejectedKeyFingerprints = new Map<string, number>();
 
 const ALLOWED_MODEL_RE = /^[a-z0-9][a-z0-9._-]{1,63}$/i;
 const DEFAULT_MODEL = 'gemini-4-hydrogen';
+const DEFAULT_VERIFICATION_MODEL = 'gemini-2.5-flash-lite';
 const PUBLIC_FALLBACK_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
   'gemini-3-flash-preview',
   'gemini-2.5-pro',
   'gemini-3.1-flash-lite',
+];
+const PREFERRED_TEXT_MODELS = [
+  'gemini-4-hydrogen',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-3-flash-preview',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-pro',
+];
+const PREFERRED_VERIFICATION_MODELS = [
+  'gemini-2.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-3-flash-preview',
+  'gemini-2.5-pro',
 ];
 
 function keyFingerprint(apiKey: string): string {
@@ -217,44 +235,55 @@ function isUnsupportedTextModelName(name: string): boolean {
   );
 }
 
+function getCompatibleTextModelName(model: { name?: string; supportedActions?: string[] }): string | undefined {
+  const name = (model.name ?? '').replace(/^models\//i, '').trim();
+  if (!name || isUnsupportedTextModelName(name)) return undefined;
+  const actions = model.supportedActions ?? [];
+  return actions.length === 0 || actions.includes('generateContent') ? name : undefined;
+}
+
+function orderTextModels(
+  discovered: string[],
+  includeFallbacks: boolean,
+  preferences = PREFERRED_TEXT_MODELS
+): string[] {
+  const ordered: string[] = [];
+  for (const model of preferences) {
+    if (discovered.includes(model)) ordered.push(model);
+  }
+  for (const model of discovered) {
+    if (!ordered.includes(model)) ordered.push(model);
+  }
+  if (includeFallbacks) {
+    for (const model of PUBLIC_FALLBACK_MODELS) {
+      if (!ordered.includes(model)) ordered.push(model);
+    }
+  }
+  return ordered;
+}
+
+async function listAvailableVerificationModels(ai: GoogleGenAI): Promise<string[]> {
+  const pager = await ai.models.list({ config: { pageSize: 50 } });
+  const discovered = pager.page
+    .map(getCompatibleTextModelName)
+    .filter((name): name is string => Boolean(name));
+  return orderTextModels(discovered, false, PREFERRED_VERIFICATION_MODELS);
+}
+
 async function listCompatibleTextModels(ai: GoogleGenAI): Promise<string[]> {
   const discovered: string[] = [];
   try {
     const pager = await ai.models.list({ config: { pageSize: 50 } });
     for await (const m of pager) {
-      const rawName = (m.name ?? '').replace(/^models\//i, '').trim();
-      if (!rawName || isUnsupportedTextModelName(rawName)) continue;
-      const actions = m.supportedActions ?? [];
-      if (actions.length === 0 || actions.includes('generateContent')) {
-        discovered.push(rawName);
-      }
+      const name = getCompatibleTextModelName(m);
+      if (name) discovered.push(name);
       if (discovered.length >= 25) break;
     }
   } catch {
     // Some restricted keys disallow models.list; caller still probes PUBLIC_FALLBACK_MODELS
   }
 
-  // Prioritize fast, modern text models first
-  const priority = [
-    'gemini-4-hydrogen',
-    'gemini-3.1-flash-lite',
-    'gemini-2.5-flash',
-    'gemini-2.5-flash-lite',
-    'gemini-3-flash-preview',
-    'gemini-2.5-pro',
-  ];
-
-  const ordered: string[] = [];
-  for (const p of priority) {
-    if (discovered.includes(p)) ordered.push(p);
-  }
-  for (const d of discovered) {
-    if (!ordered.includes(d)) ordered.push(d);
-  }
-  for (const p of PUBLIC_FALLBACK_MODELS) {
-    if (!ordered.includes(p)) ordered.push(p);
-  }
-  return ordered;
+  return orderTextModels(discovered, true);
 }
 
 export async function verifyGeminiApiKey(
@@ -268,25 +297,26 @@ export async function verifyGeminiApiKey(
   error?: string;
 }> {
   const clean = sanitizeKey(apiKey);
-  const initialModel = resolveModel(modelOverride);
+  const requestedModel = resolveModel(modelOverride);
+  const initialModel =
+    requestedModel === DEFAULT_MODEL ? DEFAULT_VERIFICATION_MODEL : requestedModel;
   if (!clean) {
     return { valid: false, model: initialModel, error: 'Gemini API key is empty.' };
   }
 
-  const ai = createGenAIClient(clean, false);
+  const ai = new GoogleGenAI({
+    apiKey: clean,
+    httpOptions: {
+      timeout: GEMINI_VERIFICATION_TIMEOUT_MS,
+      retryOptions: { attempts: 1 },
+    },
+  });
 
-  // If the user hasn't picked a public model and kept the internal default 'gemini-4-hydrogen',
-  // still try it first, but ALWAYS probe compatible public models on failure.
+  let availableModels: string[];
   try {
-    await ai.models.generateContent({
-      model: initialModel,
-      contents: 'Reply with OK.',
-    });
-    return { valid: true, model: initialModel };
+    availableModels = await listAvailableVerificationModels(ai);
   } catch (err) {
     const raw = err instanceof Error ? err.message : String(err);
-
-    // Explicitly invalid key won't succeed on any model
     if (raw.includes('API_KEY_INVALID') || raw.includes('API key not valid') || raw.includes('leaked')) {
       return {
         valid: false,
@@ -295,47 +325,105 @@ export async function verifyGeminiApiKey(
       };
     }
 
-    // Probe listed / public models before concluding the key failed
-    const candidates = (await listCompatibleTextModels(ai)).filter((m) => m !== initialModel);
-    let lastProbeErr = raw;
-    for (const candidate of candidates.slice(0, 6)) {
-      try {
-        await ai.models.generateContent({
-          model: candidate,
-          contents: 'Reply with OK.',
-        });
+    try {
+      await ai.models.generateContent({
+        model: initialModel,
+        contents: 'Reply with OK.',
+      });
+      return { valid: true, model: initialModel };
+    } catch (generationError) {
+      const generationRaw =
+        generationError instanceof Error ? generationError.message : String(generationError);
+      if (
+        generationRaw.includes('API_KEY_INVALID') ||
+        generationRaw.includes('API key not valid') ||
+        generationRaw.includes('leaked')
+      ) {
         return {
-          valid: true,
-          model: candidate,
-          availableModels: candidates.slice(0, 8),
-          note: `Switched model from ${initialModel} to ${candidate} for compatibility with your API key.`,
+          valid: false,
+          model: initialModel,
+          error: `Gemini API key was rejected: ${sanitizeErrorMessage(generationRaw, clean)}`,
         };
-      } catch (probeErr) {
-        const probeRaw = probeErr instanceof Error ? probeErr.message : String(probeErr);
-        lastProbeErr = probeRaw;
-        if (probeRaw.includes('API_KEY_INVALID') || probeRaw.includes('API key not valid') || probeRaw.includes('leaked')) {
-          return {
-            valid: false,
-            model: initialModel,
-            error: `Gemini API key was rejected: ${sanitizeErrorMessage(probeRaw, clean)}`,
-          };
-        }
       }
-    }
-
-    if (lastProbeErr.includes('RESOURCE_EXHAUSTED') || lastProbeErr.includes('429')) {
+      if (generationRaw.includes('RESOURCE_EXHAUSTED') || generationRaw.includes('429')) {
+        return {
+          valid: false,
+          model: initialModel,
+          error: 'Gemini API key rate limit or quota exceeded (429). Please check billing/quota.',
+        };
+      }
+      if (isModelNotFoundError(generationRaw)) {
+        return {
+          valid: false,
+          model: initialModel,
+          error: `The key could not use model ${initialModel}. Select a model supported by your API key and try again.`,
+        };
+      }
       return {
         valid: false,
         model: initialModel,
-        error: 'Gemini API key rate limit or quota exceeded (429). Please check billing/quota.',
+        error: `Verification failed: ${sanitizeErrorMessage(generationRaw, clean)}`,
       };
     }
+  }
 
+  if (availableModels.length === 0) {
     return {
       valid: false,
       model: initialModel,
-      error: `Verification failed: ${sanitizeErrorMessage(lastProbeErr, clean)}`,
+      error: 'This API key does not list any text-generation models. Check that Gemini API access is enabled for this key.',
     };
+  }
+
+  const candidateModels = [
+    ...(availableModels.includes(initialModel) ? [initialModel] : []),
+    ...availableModels.filter((model) => model !== initialModel),
+  ].slice(0, MAX_GEMINI_VERIFICATION_MODELS);
+  let lastUnsupportedModel: string | undefined;
+  for (const model of candidateModels) {
+    try {
+      await ai.models.generateContent({
+        model,
+        contents: 'Reply with OK.',
+      });
+      return {
+        valid: true,
+        model,
+        availableModels: availableModels.slice(0, 8),
+        note: model === initialModel ? undefined : `Using ${model}, which is available to this API key.`,
+      };
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      if (raw.includes('API_KEY_INVALID') || raw.includes('API key not valid') || raw.includes('leaked')) {
+        return {
+          valid: false,
+          model,
+          error: `Gemini API key was rejected: ${sanitizeErrorMessage(raw, clean)}`,
+        };
+      }
+      if (raw.includes('RESOURCE_EXHAUSTED') || raw.includes('429')) {
+        return {
+          valid: false,
+          model,
+          error: 'Gemini API key rate limit or quota exceeded (429). Please check billing/quota.',
+        };
+      }
+      if (!isModelNotFoundError(raw)) {
+        return {
+          valid: false,
+          model,
+          error: `Verification failed: ${sanitizeErrorMessage(raw, clean)}`,
+        };
+      }
+      lastUnsupportedModel = model;
+    }
+  }
+
+  return {
+    valid: false,
+    model: lastUnsupportedModel ?? initialModel,
+    availableModels: availableModels.slice(0, 8),
+    error: `The API key lists models but Gemini could not generate content with the checked models: ${candidateModels.join(', ')}.`,
   }
 }
 

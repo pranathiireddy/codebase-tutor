@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import type { Express } from 'express';
 import request from 'supertest';
 import nock from 'nock';
+import type { AnalyzedRepoData } from '../server/repoStore.ts';
 
 const origin = 'http://localhost:5173';
 const databasePath = path.join(os.tmpdir(), `codebase-tutor-test-${crypto.randomUUID()}.sqlite`);
@@ -51,6 +52,7 @@ afterAll(() => {
 afterEach(() => {
   nock.cleanAll();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 async function csrfToken(agent: ReturnType<typeof request.agent>): Promise<string> {
@@ -348,6 +350,189 @@ describe('persistent owner and Gemini quota records', () => {
     expect(database.consumeGeminiDailyQuota(firstUser.id, '2026-01-01', 2)).toBe(true);
     expect(database.consumeGeminiDailyQuota(firstUser.id, '2026-01-01', 2)).toBe(true);
     expect(database.consumeGeminiDailyQuota(firstUser.id, '2026-01-01', 2)).toBe(false);
+  });
+});
+
+describe('Gemini key verification', () => {
+  it('tries another listed fast model when the first listed model cannot generate content', async () => {
+    const requests: Array<{ method: string; url: string }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : undefined;
+        const url = new URL(request ? request.url : String(input));
+        requests.push({ method: init?.method ?? request?.method ?? 'GET', url: url.pathname });
+        if (url.pathname.endsWith('/models')) {
+          return new Response(
+            JSON.stringify({
+              models: [
+                { name: 'models/gemini-2.5-flash-lite', supportedActions: ['generateContent'] },
+                { name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] },
+                { name: 'models/text-embedding-004', supportedActions: ['embedContent'] },
+              ],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (url.pathname.includes('/models/gemini-2.5-flash-lite:generateContent')) {
+          return new Response(
+            JSON.stringify({
+              error: { code: 404, status: 'NOT_FOUND', message: 'Model is not supported.' },
+            }),
+            { status: 404, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              { content: { role: 'model', parts: [{ text: 'OK' }] }, finishReason: 'STOP' },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      })
+    );
+
+    const { verifyGeminiApiKey } = await import('../server/gemini.ts');
+    const result = await verifyGeminiApiKey('test-gemini-key', 'gemini-2.5-flash-lite');
+
+    expect(result.valid).toBe(true);
+    expect(result.model).toBe('gemini-2.5-flash');
+    expect(result.note).toContain('available to this API key');
+    expect(requests).toHaveLength(3);
+    expect(requests[0].url).toMatch(/\/models$/);
+    expect(requests[1].url).toContain('/models/gemini-2.5-flash-lite:generateContent');
+    expect(requests[2].url).toContain('/models/gemini-2.5-flash:generateContent');
+  });
+});
+
+describe('chat model fallback', () => {
+  it('uses the previous preferred model order after the default model is unavailable', async () => {
+    const requestPaths: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        requestPaths.push(url.pathname);
+        if (url.pathname.endsWith('/models')) {
+          return new Response(
+            JSON.stringify({
+              models: [
+                { name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] },
+                { name: 'models/gemini-3.1-flash-lite', supportedActions: ['generateContent'] },
+                { name: 'models/gemini-4-hydrogen', supportedActions: ['generateContent'] },
+              ],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (url.pathname.includes(':generateContent') && !url.pathname.includes('gemini-2.5-flash:')) {
+          return new Response(
+            JSON.stringify({
+              error: { code: 404, status: 'NOT_FOUND', message: 'Model is not supported.' },
+            }),
+            { status: 404, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        answerMarkdown: 'Grounded test response.',
+                        confidenceSummary: 'unknown',
+                      }),
+                    },
+                  ],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      })
+    );
+
+    const emptyDiagram = (type: 'system_architecture' | 'data_flow' | 'sequence' | 'cicd_pipeline' | 'deployment' | 'class_diagram') => ({
+      id: type,
+      repositoryId: 'owner__repo',
+      type,
+      title: '',
+      subtitle: '',
+      available: false,
+      summary: '',
+      coverageNotes: [],
+      nodes: [],
+      edges: [],
+    });
+    const repo = {
+      record: {
+        id: 'owner__repo',
+        owner: 'owner',
+        name: 'repo',
+        fullName: 'owner/repo',
+        url: 'https://github.com/owner/repo',
+        description: '',
+        defaultBranch: 'main',
+        commitSha: 'abcdef123456',
+        isFeaturedDemo: true,
+        stage: 'ready',
+        progress: 100,
+        stageMessage: 'Ready',
+      },
+      analysis: {
+        filesMeta: [],
+        fileContents: {},
+        fileTree: [],
+        symbols: [],
+        languages: [],
+        frameworks: [],
+        packageManagers: [],
+        testFrameworks: [],
+        infrastructureTools: [],
+        entryPoints: [],
+        workflowJobs: [],
+        deploymentUnits: [],
+        readmeSummary: '',
+        coverageNotes: [],
+      },
+      graph: {
+        repositoryId: 'owner__repo',
+        commitSha: 'abcdef123456',
+        nodes: [],
+        edges: [],
+        stats: { totalFiles: 0, analyzedFiles: 0, totalFunctions: 0, totalClasses: 0, totalEdges: 0 },
+      },
+      diagrams: {
+        system_architecture: emptyDiagram('system_architecture'),
+        data_flow: emptyDiagram('data_flow'),
+        sequence: emptyDiagram('sequence'),
+        cicd_pipeline: emptyDiagram('cicd_pipeline'),
+        deployment: emptyDiagram('deployment'),
+        class_diagram: emptyDiagram('class_diagram'),
+      },
+    } satisfies AnalyzedRepoData;
+
+    const { generateGroundedExplanation } = await import('../server/gemini.ts');
+    const result = await generateGroundedExplanation(
+      repo,
+      'Explain the repository.',
+      {},
+      [],
+      { apiKeyOverride: 'test-chat-key', modelOverride: 'gemini-4-hydrogen' }
+    );
+
+    expect(result.modelUsed).toBe('gemini-2.5-flash');
+    expect(requestPaths).toHaveLength(4);
+    expect(requestPaths[0]).toContain('/models/gemini-4-hydrogen:generateContent');
+    expect(requestPaths[1]).toMatch(/\/models$/);
+    expect(requestPaths[2]).toContain('/models/gemini-3.1-flash-lite:generateContent');
+    expect(requestPaths[3]).toContain('/models/gemini-2.5-flash:generateContent');
   });
 });
 
