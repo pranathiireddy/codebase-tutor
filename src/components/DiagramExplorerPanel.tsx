@@ -335,17 +335,45 @@ export function DiagramExplorerPanel({
 
   const rfEdges: Edge[] = useMemo(() => {
     if (!diagram) return [];
+    const nodeMap = new Map(diagram.nodes.map((n) => [n.id, n]));
+    const pairCounts = new Map<string, number>();
+
     return diagram.edges.map((e) => {
+      const src = nodeMap.get(e.source);
+      const tgt = nodeMap.get(e.target);
+
+      // Custom collision detection: check if other nodes lie between source and target
+      let collisionExtra = 0;
+      if (src && tgt) {
+        const minX = Math.min(src.x, tgt.x);
+        const maxX = Math.max(src.x, tgt.x) + 220;
+        const minY = Math.min(src.y, tgt.y);
+        const maxY = Math.max(src.y, tgt.y) + 80;
+
+        for (const n of diagram.nodes) {
+          if (n.id === e.source || n.id === e.target) continue;
+          if (n.x + 110 >= minX && n.x <= maxX && n.y + 40 >= minY && n.y <= maxY) {
+            collisionExtra += 32;
+          }
+        }
+      }
+
+      const pairKey = [e.source, e.target].sort().join('::');
+      const idx = pairCounts.get(pairKey) ?? 0;
+      pairCounts.set(pairKey, idx + 1);
+
       const isSelected = selectedEdge?.id === e.id;
       const isConnectedToSelected = selectedNode && (e.source === selectedNode.id || e.target === selectedNode.id);
       const inPath = !connectedNodeIds || (connectedNodeIds.has(e.source) && connectedNodeIds.has(e.target));
       const popUp = isSelected || isConnectedToSelected;
+      const routeOffset = 24 + collisionExtra + idx * 22;
+
       return {
         id: e.id,
         source: e.source,
         target: e.target,
-        label: e.label,
         type: 'smoothstep',
+        pathOptions: { borderRadius: 20, offset: routeOffset },
         animated: Boolean(popUp),
         markerEnd: {
           type: MarkerType.ArrowClosed,
@@ -356,16 +384,6 @@ export function DiagramExplorerPanel({
           strokeWidth: popUp ? 3 : 1.5,
           strokeDasharray: e.confidence === 'inferred' && !popUp ? '5 4' : undefined,
           opacity: inPath ? 1 : 0.15,
-        },
-        labelStyle: {
-          fill: popUp ? '#E6E9EF' : '#9CA3AF',
-          fontSize: popUp ? 11 : 10,
-          fontFamily: 'JetBrains Mono, monospace',
-          fontWeight: popUp ? 600 : 400,
-        },
-        labelBgStyle: {
-          fill: '#0B0D10',
-          fillOpacity: 0.9,
         },
       };
     });
@@ -668,8 +686,11 @@ export function DiagramExplorerPanel({
               onEdgeClick={(_evt, edge) => {
                 const ve = diagram.edges.find((de) => de.id === edge.id);
                 if (ve) {
+                  const sourceVisual = diagram.nodes.find((n) => n.id === ve.source);
+                  if (sourceVisual) {
+                    void handleSelectNode(sourceVisual);
+                  }
                   setSelectedEdge(ve);
-                  setSelectedNode(null);
                 }
               }}
               proOptions={{ hideAttribution: true }}
