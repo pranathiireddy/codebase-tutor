@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import {
   CheckCircle2,
   AlertCircle,
@@ -40,6 +40,14 @@ interface VerifyResponse {
   };
 }
 
+interface GitHubSettingsStatus {
+  githubOAuthConfigured: boolean;
+  githubAppConfigured: boolean;
+  passwordSet: boolean;
+  githubAccount: { login: string; avatarUrl: string | null } | null;
+  installations: Array<{ installationId: string; accountLogin: string }>;
+}
+
 const PRESET_MODELS = [
   'gemini-4-hydrogen',
   'gemini-3.1-flash-lite',
@@ -49,6 +57,7 @@ const PRESET_MODELS = [
 ] as const;
 
 export function SettingsPage() {
+  const [searchParams] = useSearchParams();
   const {
     preferences,
     updatePreferences,
@@ -83,6 +92,15 @@ export function SettingsPage() {
   const [verifyError, setVerifyError] = useState<string | null>(null);
   const [savedBanner, setSavedBanner] = useState<string | null>(null);
   const [serverStatus, setServerStatus] = useState<ServerKeyStatus | null>(null);
+  const [githubSettings, setGithubSettings] = useState<GitHubSettingsStatus | null>(null);
+  const [githubSettingsError, setGithubSettingsError] = useState<string | null>(null);
+  const [githubActionError, setGithubActionError] = useState<string | null>(null);
+  const [githubActionNotice, setGithubActionNotice] = useState<string | null>(null);
+  const [githubBusy, setGithubBusy] = useState(false);
+  const [privateAccessConsent, setPrivateAccessConsent] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [passwordBusy, setPasswordBusy] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -102,6 +120,47 @@ export function SettingsPage() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadGitHubSettings() {
+      try {
+        const res = await apiFetch('/api/settings/github');
+        const data = await safeJson<GitHubSettingsStatus & { error?: string }>(res);
+        if (!res.ok) throw new Error(data.error || 'Unable to load GitHub settings.');
+        if (!cancelled) setGithubSettings(data);
+      } catch (error) {
+        if (!cancelled) {
+          setGithubSettingsError(error instanceof Error ? error.message : 'Unable to load GitHub settings.');
+        }
+      }
+    }
+    void loadGitHubSettings();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (searchParams.get('github') === 'connected') {
+      setGithubActionNotice('GitHub sign-in is connected.');
+    } else if (searchParams.get('private_access') === 'connected') {
+      setGithubActionNotice('Read-only private repository access is connected.');
+    }
+    const error = searchParams.get('github_error');
+    if (error) {
+      const messages: Record<string, string> = {
+        access_denied: 'GitHub authorization was denied.',
+        expired_attempt: 'That GitHub request expired or could not be verified. Please try again.',
+        github_account_linked: 'That GitHub account is already connected to another account.',
+        github_already_linked: 'A different GitHub account is already connected. Disconnect it first.',
+        private_access_denied: 'GitHub App access was not granted.',
+        private_install_failed: 'The GitHub App installation could not be verified. Please try again.',
+        session_changed: 'Your sign-in session changed. Please sign in again before connecting GitHub.',
+      };
+      setGithubActionError(messages[error] ?? 'GitHub could not complete the request. Please try again.');
+    }
+  }, [searchParams]);
 
   const effectiveModel =
     modelPreset === 'custom'
@@ -221,6 +280,120 @@ export function SettingsPage() {
     }
   };
 
+  const handleSavePassword = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setGithubActionError(null);
+    setGithubActionNotice(null);
+    setPasswordBusy(true);
+    try {
+      const res = await apiFetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...(githubSettings?.passwordSet ? { currentPassword } : {}),
+          newPassword,
+        }),
+      });
+      const data = await safeJson<{ error?: string }>(res);
+      if (!res.ok) throw new Error(data.error || 'Unable to save password.');
+      setGithubSettings((current) => current ? { ...current, passwordSet: true } : current);
+      setCurrentPassword('');
+      setNewPassword('');
+      setGithubActionNotice('Password saved. Other sessions have been signed out.');
+    } catch (error) {
+      setGithubActionError(error instanceof Error ? error.message : 'Unable to save password.');
+    } finally {
+      setPasswordBusy(false);
+    }
+  };
+
+  const handleDisconnectGitHub = async () => {
+    setGithubBusy(true);
+    setGithubActionError(null);
+    setGithubActionNotice(null);
+    try {
+      const res = await apiFetch('/api/auth/github/disconnect', { method: 'POST' });
+      const data = await safeJson<{ error?: string }>(res);
+      if (!res.ok) throw new Error(data.error || 'Unable to disconnect GitHub.');
+      setGithubSettings((current) => current ? { ...current, githubAccount: null } : current);
+      setGithubActionNotice('GitHub sign-in disconnected.');
+    } catch (error) {
+      setGithubActionError(error instanceof Error ? error.message : 'Unable to disconnect GitHub.');
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+
+  const handleStartGitHubLink = async () => {
+    setGithubBusy(true);
+    setGithubActionError(null);
+    try {
+      const res = await apiFetch('/api/auth/github/link/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ redirectAfter: '/settings' }),
+      });
+      const data = await safeJson<{ authorizationUrl?: string; error?: string }>(res);
+      if (!res.ok || !data.authorizationUrl) {
+        throw new Error(data.error || 'Unable to start GitHub account linking.');
+      }
+      window.location.assign(data.authorizationUrl);
+    } catch (error) {
+      setGithubActionError(error instanceof Error ? error.message : 'Unable to start GitHub account linking.');
+      setGithubBusy(false);
+    }
+  };
+
+  const handleStartPrivateAccess = async () => {
+    setGithubBusy(true);
+    setGithubActionError(null);
+    try {
+      const res = await apiFetch('/api/settings/github-app/install/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          consent: 'read_only_contents',
+          redirectAfter: '/settings',
+        }),
+      });
+      const data = await safeJson<{ authorizationUrl?: string; error?: string }>(res);
+      if (!res.ok || !data.authorizationUrl) {
+        throw new Error(data.error || 'Unable to start GitHub App installation.');
+      }
+      window.location.assign(data.authorizationUrl);
+    } catch (error) {
+      setGithubActionError(error instanceof Error ? error.message : 'Unable to start GitHub App installation.');
+      setGithubBusy(false);
+    }
+  };
+
+  const handleRevokePrivateAccess = async (installationId: string) => {
+    setGithubBusy(true);
+    setGithubActionError(null);
+    setGithubActionNotice(null);
+    try {
+      const res = await apiFetch(
+        `/api/settings/github-app/installations/${encodeURIComponent(installationId)}`,
+        { method: 'DELETE' }
+      );
+      const data = await safeJson<{ error?: string }>(res);
+      if (!res.ok) throw new Error(data.error || 'Unable to revoke GitHub App access.');
+      setGithubSettings((current) => current
+        ? {
+            ...current,
+            installations: current.installations.filter(
+              (installation) => installation.installationId !== installationId
+            ),
+          }
+        : current);
+      setGithubActionNotice('GitHub App access was revoked.');
+    } catch (error) {
+      setGithubActionError(error instanceof Error ? error.message : 'Unable to revoke GitHub App access.');
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-[#0B0D10] text-[#E6E9EF]">
       <TopNav />
@@ -238,6 +411,150 @@ export function SettingsPage() {
             <div className="text-[#9CA3AF]">{user.email} · {user.role}</div>
           </section>
         )}
+
+        <section className="space-y-5 rounded-xl border border-[#232832] bg-[#111419] p-6">
+          <div className="border-b border-[#232832] pb-4">
+            <h2 className="flex items-center gap-2 text-sm font-semibold text-[#F3F4F6]">
+              <GitBranch className="h-4 w-4 text-sky-400" />
+              GitHub sign-in and private repositories
+            </h2>
+            <p className="mt-1 text-[11px] leading-relaxed text-[#9CA3AF]">
+              GitHub sign-in reads your name, avatar and primary verified email. Private repository access is separate and limited to read-only Contents.
+            </p>
+          </div>
+
+          {githubActionNotice && (
+            <div className="rounded border border-emerald-500/30 bg-emerald-500/10 p-2.5 text-xs text-emerald-300">
+              {githubActionNotice}
+            </div>
+          )}
+          {(githubSettingsError || githubActionError) && (
+            <div className="rounded border border-rose-500/30 bg-rose-500/10 p-2.5 text-xs text-rose-300">
+              {githubActionError || githubSettingsError}
+            </div>
+          )}
+
+          {githubSettings?.githubAccount ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#232832] bg-[#0B0D10] p-3">
+              <div className="flex items-center gap-3">
+                {githubSettings.githubAccount.avatarUrl && (
+                  <img
+                    src={githubSettings.githubAccount.avatarUrl}
+                    alt=""
+                    className="h-8 w-8 rounded-full"
+                  />
+                )}
+                <div>
+                  <div className="text-xs font-medium text-[#E6E9EF]">
+                    Connected as @{githubSettings.githubAccount.login}
+                  </div>
+                  <div className="text-[11px] text-[#9CA3AF]">GitHub sign-in</div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleDisconnectGitHub}
+                disabled={githubBusy || !githubSettings.passwordSet}
+                className="rounded border border-[#3B414D] px-3 py-1.5 text-[11px] text-[#D1D5DB] hover:border-rose-500 hover:text-rose-300 disabled:opacity-50"
+              >
+                Disconnect
+              </button>
+            </div>
+          ) : githubSettings?.githubOAuthConfigured ? (
+            <button
+              type="button"
+              onClick={() => void handleStartGitHubLink()}
+              disabled={githubBusy}
+              className="inline-flex rounded-md border border-[#3B414D] px-3 py-2 text-xs font-medium text-[#E6E9EF] hover:border-sky-500 hover:text-sky-300 disabled:opacity-50"
+            >
+              Connect GitHub sign-in
+            </button>
+          ) : null}
+
+          {githubSettings && (
+            <form onSubmit={handleSavePassword} className="space-y-3 rounded-lg border border-[#232832] bg-[#0B0D10] p-3">
+              <div className="text-xs font-medium text-[#E6E9EF]">
+                {githubSettings.passwordSet ? 'Change password' : 'Set a password'}
+              </div>
+              {githubSettings.passwordSet && (
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  aria-label="Current password"
+                  placeholder="Current password"
+                  required
+                  value={currentPassword}
+                  onChange={(event) => setCurrentPassword(event.target.value)}
+                  className="w-full rounded-md border border-[#232832] bg-[#111419] px-3 py-2 text-xs text-[#E6E9EF] focus:border-sky-500 focus:outline-none"
+                />
+              )}
+              <input
+                type="password"
+                autoComplete="new-password"
+                aria-label="New password"
+                placeholder="New password (at least 12 characters)"
+                minLength={12}
+                required
+                value={newPassword}
+                onChange={(event) => setNewPassword(event.target.value)}
+                className="w-full rounded-md border border-[#232832] bg-[#111419] px-3 py-2 text-xs text-[#E6E9EF] focus:border-sky-500 focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={passwordBusy}
+                className="rounded-md bg-sky-500 px-3 py-2 text-[11px] font-semibold text-[#0B0D10] hover:bg-sky-400 disabled:opacity-50"
+              >
+                {passwordBusy ? 'Saving...' : githubSettings.passwordSet ? 'Save new password' : 'Set password'}
+              </button>
+            </form>
+          )}
+
+          {githubSettings?.githubAppConfigured && (
+            <div className="space-y-3 rounded-lg border border-[#232832] bg-[#0B0D10] p-3">
+              <div>
+                <div className="text-xs font-medium text-[#E6E9EF]">Optional private repository access</div>
+                <p className="mt-1 text-[11px] leading-relaxed text-[#9CA3AF]">
+                  The GitHub App can read repository Contents only. Private code is held in server memory for analysis and is not written to disk or the database. You can revoke access here at any time.
+                </p>
+              </div>
+              {githubSettings.installations.map((installation) => (
+                <div
+                  key={installation.installationId}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded border border-[#232832] p-2"
+                >
+                  <span className="text-xs text-[#D1D5DB]">Connected to @{installation.accountLogin}</span>
+                  <button
+                    type="button"
+                    onClick={() => void handleRevokePrivateAccess(installation.installationId)}
+                    disabled={githubBusy}
+                    className="rounded border border-[#3B414D] px-2.5 py-1 text-[11px] text-[#D1D5DB] hover:border-rose-500 hover:text-rose-300 disabled:opacity-50"
+                  >
+                    Revoke access
+                  </button>
+                </div>
+              ))}
+              <label className="flex items-start gap-2 text-[11px] text-[#D1D5DB]">
+                <input
+                  type="checkbox"
+                  checked={privateAccessConsent}
+                  onChange={(event) => setPrivateAccessConsent(event.target.checked)}
+                  className="mt-0.5 accent-sky-500"
+                />
+                <span>
+                  I authorize Codebase Tutor to access private repository contents with read-only permission. I understand the code is processed in memory only.
+                </span>
+              </label>
+              <button
+                type="button"
+                onClick={() => void handleStartPrivateAccess()}
+                disabled={!privateAccessConsent || githubBusy}
+                className="rounded-md bg-sky-500 px-3 py-2 text-[11px] font-semibold text-[#0B0D10] hover:bg-sky-400 disabled:opacity-50"
+              >
+                {githubBusy ? 'Connecting...' : 'Authorize read-only access'}
+              </button>
+            </div>
+          )}
+        </section>
 
         {/* Bring Your Own Gemini & GitHub Keys */}
         <section className="space-y-5 rounded-xl border border-[#232832] bg-[#111419] p-6">

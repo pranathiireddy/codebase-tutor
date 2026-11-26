@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import cookieParser from 'cookie-parser';
+import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import {
   clearRepositoryCache,
@@ -26,7 +27,12 @@ import {
   clearChats,
   completeTourStep,
   createChat,
+  createOAuthState,
+  createOAuthUser,
+  consumeOAuthState,
   deleteChat,
+  findOAuthAccount,
+  getOAuthAccountForUser,
   getAllChatMessages,
   getChat,
   getChatMessages,
@@ -39,9 +45,13 @@ import {
   listExploredItems,
   listTourProgress,
   listActiveSessions,
+  listGithubAppInstallations,
   markExploredItem,
   recordAuditEvent,
   recordFailedLogin,
+  refreshOAuthAccount,
+  linkOAuthAccount,
+  unlinkOAuthAccount,
   renameChat,
   revokeAllSessions,
   revokeSession,
@@ -51,6 +61,8 @@ import {
 } from './db/index.ts';
 import {
   clearSessionCookie,
+  clearGitHubAppStateCookie,
+  clearGitHubOAuthStateCookie,
   createSessionCredentials,
   csrfProtection,
   currentSessionIdHash,
@@ -63,6 +75,11 @@ import {
   optionalAuth,
   requireAuth,
   setSessionCookie,
+  setGitHubAppStateCookie,
+  setGitHubOAuthStateCookie,
+  GITHUB_APP_STATE_COOKIE_NAME,
+  GITHUB_OAUTH_STATE_COOKIE_NAME,
+  GITHUB_OAUTH_STATE_TTL_MS,
   SESSION_IDLE_TIMEOUT_MS,
   signupRateLimiter,
   validatePassword,
@@ -70,6 +87,16 @@ import {
   verifyPassword,
 } from './auth.ts';
 import type { ChatCitation, ChatContext, DiagramType, UserProfile } from '../src/types/codebase.ts';
+import { getGitHubAuthorizationUrl, fetchGitHubIdentity, GitHubOAuthError } from './githubOAuth.ts';
+import { encryptSecret, decryptSecret } from './secretCrypto.ts';
+import {
+  getGitHubAppInstallUrl,
+  getGitHubAppTokenForRepository,
+  GitHubAppError,
+  removeGitHubAppInstallation,
+  storeGitHubAppInstallation,
+} from './githubApp.ts';
+import { parseGitHubUrl } from './github.ts';
 
 const DIAGRAM_TYPES = [
   'system_architecture',
@@ -190,6 +217,72 @@ export function createApp(): express.Express {
     return consumeGeminiDailyQuota(userId, today, config.serverKeyDailyCap);
   }
 
+  const githubStartLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many GitHub sign-in attempts. Try again later.' },
+  });
+  const githubCallbackLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many GitHub sign-in attempts. Try again later.' },
+  });
+
+  function parseRelativeRedirect(value: unknown, fallback: string): string | undefined {
+    if (value === undefined) return fallback;
+    if (
+      typeof value !== 'string' ||
+      value.length > 2048 ||
+      !value.startsWith('/') ||
+      value.startsWith('//') ||
+      value.includes('\\') ||
+      /[\u0000-\u001f]/.test(value)
+    ) {
+      return undefined;
+    }
+    try {
+      const url = new URL(value, 'https://codebase-tutor.invalid');
+      if (url.origin !== 'https://codebase-tutor.invalid') return undefined;
+      return `${url.pathname}${url.search}${url.hash}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function addRedirectResult(path: string, name: string, value: string): string {
+    const url = new URL(path, 'https://codebase-tutor.invalid');
+    url.searchParams.set(name, value);
+    return `${url.pathname}${url.search}${url.hash}`;
+  }
+
+  function compareStateValues(left: string, right: string): boolean {
+    const leftBuffer = Buffer.from(left);
+    const rightBuffer = Buffer.from(right);
+    return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+  }
+
+  function hashOAuthState(state: string): string {
+    return crypto.createHash('sha256').update(state).digest('hex');
+  }
+
+  function completeGitHubLogin(
+    req: Request,
+    res: Response,
+    user: { id: string; email: string; name: string; role: string },
+    redirectAfter: string
+  ): void {
+    const { token, session } = createSessionCredentials(user.id, req);
+    createSession(session);
+    setSessionCookie(res, token);
+    clearFailedLogins(user.id, session.now);
+    audit(req, 'github_login_success', user.id);
+    res.redirect(redirectAfter);
+  }
+
 // Health check
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', service: 'codebase-tutor' });
@@ -199,6 +292,236 @@ app.get('/api/health', (_req: Request, res: Response) => {
 app.get('/api/auth/csrf', (req: Request, res: Response) => {
   res.json({ csrfToken: res.locals.csrfToken ?? req.cookies?.codebase_tutor_csrf });
 });
+
+app.get('/api/auth/github/config', (_req: Request, res: Response) => {
+  res.json({ enabled: config.githubOAuthConfigured });
+});
+
+app.get('/api/auth/github/start', githubStartLimiter, optionalAuth, (req: Request, res: Response) => {
+  const rawPurpose = req.query.purpose;
+  if (rawPurpose !== undefined && rawPurpose !== 'login') {
+    res.status(400).json({ error: 'GitHub account linking must be started by an authenticated request.' });
+    return;
+  }
+  const auth = getAuthContext(res);
+  if (!config.githubOAuthConfigured) {
+    res.status(503).json({ error: 'GitHub sign-in is not configured.' });
+    return;
+  }
+  const redirectAfter = parseRelativeRedirect(
+    req.query.redirect_after,
+    '/workspace'
+  );
+  if (!redirectAfter) {
+    res.status(400).json({ error: 'The redirect must be a relative path.' });
+    return;
+  }
+
+  const state = crypto.randomBytes(32).toString('base64url');
+  const verifier = crypto.randomBytes(32).toString('base64url');
+  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+  const now = Date.now();
+  const authorizationUrl = getGitHubAuthorizationUrl(state, challenge);
+  createOAuthState({
+    stateHash: hashOAuthState(state),
+    codeVerifierEnc: encryptSecret(verifier),
+    purpose: 'login',
+    userId: null,
+    redirectAfter,
+    createdAt: now,
+    expiresAt: now + GITHUB_OAUTH_STATE_TTL_MS,
+    usedAt: null,
+  });
+  setGitHubOAuthStateCookie(res, state);
+  audit(req, 'github_login_start', auth?.user.id ?? null);
+  res.redirect(authorizationUrl);
+});
+
+app.post(
+  '/api/auth/github/link/start',
+  githubStartLimiter,
+  requireAuth,
+  (req: Request, res: Response) => {
+    const auth = getAuthContext(res)!;
+    if (!config.githubOAuthConfigured) {
+      res.status(503).json({ error: 'GitHub sign-in is not configured.' });
+      return;
+    }
+    const redirectAfter = parseRelativeRedirect(
+      (req.body as { redirectAfter?: unknown })?.redirectAfter,
+      '/settings'
+    );
+    if (!redirectAfter) {
+      res.status(400).json({ error: 'The redirect must be a relative path.' });
+      return;
+    }
+
+    const state = crypto.randomBytes(32).toString('base64url');
+    const verifier = crypto.randomBytes(32).toString('base64url');
+    const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+    const now = Date.now();
+    const authorizationUrl = getGitHubAuthorizationUrl(state, challenge);
+    createOAuthState({
+      stateHash: hashOAuthState(state),
+      codeVerifierEnc: encryptSecret(verifier),
+      purpose: 'link',
+      userId: auth.user.id,
+      redirectAfter,
+      createdAt: now,
+      expiresAt: now + GITHUB_OAUTH_STATE_TTL_MS,
+      usedAt: null,
+    });
+    setGitHubOAuthStateCookie(res, state);
+    audit(req, 'github_link_start', auth.user.id);
+    res.json({ authorizationUrl });
+  }
+);
+
+app.get(
+  '/api/auth/github/callback',
+  githubCallbackLimiter,
+  optionalAuth,
+  async (req: Request, res: Response, next: NextFunction) => {
+    const stateValue = req.query.state;
+    const cookieState = req.cookies?.[GITHUB_OAUTH_STATE_COOKIE_NAME];
+    if (
+      typeof stateValue !== 'string' ||
+      typeof cookieState !== 'string' ||
+      !compareStateValues(stateValue, cookieState)
+    ) {
+      clearGitHubOAuthStateCookie(res);
+      audit(req, 'github_login_failure', null, { reason: 'state_mismatch' });
+      res.redirect('/login?github_error=expired_attempt');
+      return;
+    }
+
+    const state = consumeOAuthState(hashOAuthState(stateValue), Date.now());
+    clearGitHubOAuthStateCookie(res);
+    if (!state || (state.purpose !== 'login' && state.purpose !== 'link')) {
+      audit(req, 'github_login_failure', null, { reason: 'expired_attempt' });
+      res.redirect('/login?github_error=expired_attempt');
+      return;
+    }
+    const isLink = state.purpose === 'link';
+    const failureEvent = isLink ? 'github_link_failure' : 'github_login_failure';
+    const failureRedirect = (reason: string) => {
+      audit(req, failureEvent, state.userId, { reason });
+      res.redirect(addRedirectResult(
+        isLink ? state.redirectAfter : state.redirectAfter === '/signup' ? '/signup' : '/login',
+        'github_error',
+        reason
+      ));
+    };
+    const auth = getAuthContext(res);
+    if (isLink && (!auth || auth.user.id !== state.userId)) {
+      failureRedirect('session_changed');
+      return;
+    }
+    if (typeof req.query.error === 'string') {
+      failureRedirect(req.query.error === 'access_denied' ? 'access_denied' : 'provider_error');
+      return;
+    }
+    const code = req.query.code;
+    if (typeof code !== 'string' || !code || !state.codeVerifierEnc) {
+      failureRedirect('invalid_code');
+      return;
+    }
+
+    let identity: Awaited<ReturnType<typeof fetchGitHubIdentity>>;
+    try {
+      identity = await fetchGitHubIdentity(code, decryptSecret(state.codeVerifierEnc));
+    } catch (error) {
+      const reason = error instanceof GitHubOAuthError ? error.code : 'provider_error';
+      failureRedirect(reason);
+      return;
+    }
+
+    try {
+      if (isLink) {
+        const currentUserId = auth!.user.id;
+        const linkedIdentity = findOAuthAccount(identity.providerUserId);
+        if (linkedIdentity && linkedIdentity.user.id !== currentUserId) {
+          failureRedirect('github_account_linked');
+          return;
+        }
+        const currentLink = getOAuthAccountForUser(currentUserId);
+        if (currentLink && currentLink.providerUserId !== identity.providerUserId) {
+          failureRedirect('github_already_linked');
+          return;
+        }
+        if (linkedIdentity) {
+          refreshOAuthAccount(
+            identity.providerUserId,
+            identity.providerLogin,
+            identity.avatarUrl,
+            Date.now()
+          );
+        } else if (!linkOAuthAccount({
+          id: crypto.randomUUID(),
+          userId: currentUserId,
+          providerUserId: identity.providerUserId,
+          providerLogin: identity.providerLogin,
+          avatarUrl: identity.avatarUrl,
+          now: Date.now(),
+        })) {
+          failureRedirect('github_account_linked');
+          return;
+        }
+        audit(req, 'github_account_linked', currentUserId);
+        res.redirect(addRedirectResult(state.redirectAfter, 'github', 'connected'));
+        return;
+      }
+
+      const linked = findOAuthAccount(identity.providerUserId);
+      if (linked) {
+        refreshOAuthAccount(
+          identity.providerUserId,
+          identity.providerLogin,
+          identity.avatarUrl,
+          Date.now()
+        );
+        const successRedirect = ['/login', '/signup'].includes(state.redirectAfter)
+          ? '/workspace'
+          : state.redirectAfter;
+        completeGitHubLogin(req, res, linked.user, successRedirect);
+        return;
+      }
+
+      const now = Date.now();
+      const outcome = createOAuthUser(
+        {
+          id: crypto.randomUUID(),
+          email: identity.verifiedEmail,
+          name: identity.name,
+          role: 'Student / Developer',
+          emailVerifiedAt: now,
+        },
+        {
+          id: crypto.randomUUID(),
+          providerUserId: identity.providerUserId,
+          providerLogin: identity.providerLogin,
+          avatarUrl: identity.avatarUrl,
+          now,
+        }
+      );
+      const concurrentLogin = findOAuthAccount(identity.providerUserId);
+      if (concurrentLogin) {
+        const successRedirect = ['/login', '/signup'].includes(state.redirectAfter)
+          ? '/workspace'
+          : state.redirectAfter;
+        completeGitHubLogin(req, res, concurrentLogin.user, successRedirect);
+        return;
+      }
+      if (outcome === 'email_exists') {
+        failureRedirect('existing_email');
+        return;
+      }
+      failureRedirect('github_account_linked');
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 app.post('/api/auth/signup', signupRateLimiter(), async (req: Request, res: Response) => {
   const { name, email, password, role } = (req.body ?? {}) as {
@@ -273,7 +596,10 @@ app.post(
       return;
     }
 
-    if (!(await verifyPassword(user.passwordHash, password))) {
+    const passwordMatches = user.passwordHash
+      ? await verifyPassword(user.passwordHash, password)
+      : (await verifyDummyPassword(password), false);
+    if (!passwordMatches) {
       const failure = recordFailedLogin(user.id, now, LOGIN_LOCK_THRESHOLD, LOGIN_LOCK_DURATION_MS);
       audit(req, 'login_failure', user.id, { reason: 'invalid_credentials' });
       if (failure.lockedUntil !== null && failure.failedLogins === LOGIN_LOCK_THRESHOLD) {
@@ -304,12 +630,19 @@ app.post('/api/auth/change-password', requireAuth, async (req: Request, res: Res
     currentPassword?: unknown;
     newPassword?: unknown;
   };
-  if (typeof body.currentPassword !== 'string' || typeof body.newPassword !== 'string') {
-    res.status(400).json({ error: 'Enter your current password and a new password.' });
+  if (typeof body.newPassword !== 'string') {
+    res.status(400).json({ error: 'Enter a new password.' });
     return;
   }
   const user = findUserById(auth.user.id);
-  if (!user || !(await verifyPassword(user.passwordHash, body.currentPassword))) {
+  if (!user) {
+    res.status(404).json({ error: 'Account not found.' });
+    return;
+  }
+  if (user.passwordHash && (
+    typeof body.currentPassword !== 'string' ||
+    !(await verifyPassword(user.passwordHash, body.currentPassword))
+  )) {
     res.status(400).json({ error: 'Current password is incorrect.' });
     return;
   }
@@ -374,6 +707,169 @@ app.post('/api/auth/logout', optionalAuth, (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+app.get('/api/settings/github', requireAuth, (_req: Request, res: Response) => {
+  const auth = getAuthContext(res)!;
+  const user = findUserById(auth.user.id);
+  if (!user) {
+    res.status(404).json({ error: 'Account not found.' });
+    return;
+  }
+  const account = getOAuthAccountForUser(user.id);
+  res.json({
+    githubOAuthConfigured: config.githubOAuthConfigured,
+    passwordSet: Boolean(user.passwordHash),
+    githubAccount: account
+      ? { login: account.providerLogin, avatarUrl: account.avatarUrl }
+      : null,
+    githubAppConfigured: config.githubAppConfigured,
+    installations: listGithubAppInstallations(user.id).map((installation) => ({
+      installationId: installation.installationId,
+      accountLogin: installation.accountLogin,
+    })),
+  });
+});
+
+app.post('/api/auth/github/disconnect', requireAuth, (req: Request, res: Response) => {
+  const auth = getAuthContext(res)!;
+  const user = findUserById(auth.user.id);
+  if (!user) {
+    res.status(404).json({ error: 'Account not found.' });
+    return;
+  }
+  if (!user.passwordHash) {
+    res.status(409).json({ error: 'Set a password before disconnecting your only sign-in method.' });
+    return;
+  }
+  if (!unlinkOAuthAccount(user.id)) {
+    res.status(404).json({ error: 'No GitHub account is connected.' });
+    return;
+  }
+  audit(req, 'github_account_unlinked', user.id);
+  res.json({ ok: true });
+});
+
+app.post(
+  '/api/settings/github-app/install/start',
+  githubStartLimiter,
+  requireAuth,
+  (req: Request, res: Response) => {
+    const auth = getAuthContext(res)!;
+    if (!config.githubAppConfigured) {
+      res.status(503).json({ error: 'Private repository access is not configured.' });
+      return;
+    }
+    if ((req.body as { consent?: unknown })?.consent !== 'read_only_contents') {
+      res.status(400).json({ error: 'Confirm the read-only Contents access before continuing.' });
+      return;
+    }
+    const redirectAfter = parseRelativeRedirect(
+      (req.body as { redirectAfter?: unknown })?.redirectAfter,
+      '/settings'
+    );
+    if (!redirectAfter) {
+      res.status(400).json({ error: 'The redirect must be a relative path.' });
+      return;
+    }
+
+    const state = crypto.randomBytes(32).toString('base64url');
+    const now = Date.now();
+    const authorizationUrl = getGitHubAppInstallUrl(state);
+    createOAuthState({
+      stateHash: hashOAuthState(state),
+      codeVerifierEnc: null,
+      purpose: 'private_install',
+      userId: auth.user.id,
+      redirectAfter,
+      createdAt: now,
+      expiresAt: now + GITHUB_OAUTH_STATE_TTL_MS,
+      usedAt: null,
+    });
+    setGitHubAppStateCookie(res, state);
+    audit(req, 'github_private_access_start', auth.user.id);
+    res.json({ authorizationUrl });
+  }
+);
+
+app.get(
+  '/api/auth/github-app/callback',
+  githubCallbackLimiter,
+  optionalAuth,
+  async (req: Request, res: Response, next: NextFunction) => {
+    const stateValue = req.query.state;
+    const cookieState = req.cookies?.[GITHUB_APP_STATE_COOKIE_NAME];
+    if (
+      typeof stateValue !== 'string' ||
+      typeof cookieState !== 'string' ||
+      !compareStateValues(stateValue, cookieState)
+    ) {
+      clearGitHubAppStateCookie(res);
+      audit(req, 'github_private_access_failure', null, { reason: 'state_mismatch' });
+      res.redirect('/settings?github_error=expired_attempt');
+      return;
+    }
+    const state = consumeOAuthState(hashOAuthState(stateValue), Date.now());
+    clearGitHubAppStateCookie(res);
+    if (
+      !state ||
+      state.purpose !== 'private_install' ||
+      !state.userId ||
+      getAuthContext(res)?.user.id !== state.userId
+    ) {
+      audit(req, 'github_private_access_failure', state?.userId ?? null, {
+        reason: 'expired_attempt',
+      });
+      res.redirect('/settings?github_error=expired_attempt');
+      return;
+    }
+    const installationId = req.query.installation_id;
+    if (
+      (req.query.setup_action !== 'install' && req.query.setup_action !== 'update') ||
+      typeof installationId !== 'string' ||
+      !/^\d{1,20}$/.test(installationId)
+    ) {
+      audit(req, 'github_private_access_failure', state.userId, { reason: 'installation_denied' });
+      res.redirect(addRedirectResult(state.redirectAfter, 'github_error', 'private_access_denied'));
+      return;
+    }
+
+    try {
+      await storeGitHubAppInstallation(state.userId, installationId);
+      audit(req, 'github_private_access_granted', state.userId);
+      res.redirect(addRedirectResult(state.redirectAfter, 'private_access', 'connected'));
+    } catch (error) {
+      if (!(error instanceof GitHubAppError)) {
+        next(error);
+        return;
+      }
+      audit(req, 'github_private_access_failure', state.userId, { reason: 'installation_failed' });
+      res.redirect(addRedirectResult(state.redirectAfter, 'github_error', 'private_install_failed'));
+    }
+  }
+);
+
+app.delete(
+  '/api/settings/github-app/installations/:installationId',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    const auth = getAuthContext(res)!;
+    const installationId = String(req.params.installationId);
+    if (!/^\d{1,20}$/.test(installationId)) {
+      res.status(400).json({ error: 'Invalid GitHub App installation identifier.' });
+      return;
+    }
+    try {
+      await removeGitHubAppInstallation(auth.user.id, installationId);
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : 'Unable to revoke the GitHub App installation.',
+      });
+      return;
+    }
+    audit(req, 'github_private_access_revoked', auth.user.id);
+    res.json({ ok: true });
+  }
+);
+
 // Repositories API
 app.get('/api/repositories', optionalAuth, (_req: Request, res: Response) => {
   const user = getRequestUser(res);
@@ -423,12 +919,20 @@ app.post('/api/settings/verify', requireAuth, async (req: Request, res: Response
 app.post('/api/repositories/analyze', requireAuth, async (req: Request, res: Response) => {
   const user = getRequestUser(res)!;
   const { url, forceRefresh } = req.body as { url?: string; forceRefresh?: boolean };
-  const githubToken = req.header('x-github-token')?.trim() || undefined;
+  let githubToken = req.header('x-github-token')?.trim() || undefined;
   if (!url || typeof url !== 'string') {
     res.status(400).json({ error: 'Repository URL is required.' });
     return;
   }
   try {
+    if (!githubToken) {
+      const repository = parseGitHubUrl(url);
+      githubToken = await getGitHubAppTokenForRepository(
+        user.id,
+        repository.owner,
+        repository.name
+      );
+    }
     const record = await startRepositoryAnalysis(url, {
       forceRefresh: Boolean(forceRefresh),
       githubToken,

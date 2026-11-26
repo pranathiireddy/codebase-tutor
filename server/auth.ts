@@ -11,6 +11,9 @@ import {
 
 export const SESSION_COOKIE_NAME = 'codebase_tutor_session';
 export const CSRF_COOKIE_NAME = 'codebase_tutor_csrf';
+export const GITHUB_OAUTH_STATE_COOKIE_NAME = 'codebase_tutor_github_oauth_state';
+export const GITHUB_APP_STATE_COOKIE_NAME = 'codebase_tutor_github_app_state';
+export const GITHUB_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 export const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 export const SESSION_ABSOLUTE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
 export const LOGIN_LOCK_THRESHOLD = 5;
@@ -195,6 +198,30 @@ export function setSessionCookie(res: Response, token: string): void {
 
 export function clearSessionCookie(res: Response): void {
   res.clearCookie(SESSION_COOKIE_NAME, { ...COOKIE_OPTIONS, httpOnly: true });
+}
+
+export function setGitHubOAuthStateCookie(res: Response, state: string): void {
+  res.cookie(GITHUB_OAUTH_STATE_COOKIE_NAME, state, {
+    ...COOKIE_OPTIONS,
+    httpOnly: true,
+    maxAge: GITHUB_OAUTH_STATE_TTL_MS,
+  });
+}
+
+export function clearGitHubOAuthStateCookie(res: Response): void {
+  res.clearCookie(GITHUB_OAUTH_STATE_COOKIE_NAME, { ...COOKIE_OPTIONS, httpOnly: true });
+}
+
+export function setGitHubAppStateCookie(res: Response, state: string): void {
+  res.cookie(GITHUB_APP_STATE_COOKIE_NAME, state, {
+    ...COOKIE_OPTIONS,
+    httpOnly: true,
+    maxAge: GITHUB_OAUTH_STATE_TTL_MS,
+  });
+}
+
+export function clearGitHubAppStateCookie(res: Response): void {
+  res.clearCookie(GITHUB_APP_STATE_COOKIE_NAME, { ...COOKIE_OPTIONS, httpOnly: true });
 }
 
 export function currentSessionIdHash(req: Request): string | undefined {

@@ -11,12 +11,45 @@ export interface StoredUser {
   name: string;
   role: string;
   emailVerifiedAt: number | null;
-  passwordHash: string;
+  passwordHash: string | null;
   createdAt: number;
   updatedAt: number;
   failedLogins: number;
   lockedUntil: number | null;
   deletedAt: number | null;
+}
+
+export interface OAuthAccountRecord {
+  id: string;
+  userId: string;
+  provider: 'github';
+  providerUserId: string;
+  providerLogin: string;
+  avatarUrl: string | null;
+  createdAt: number;
+  lastLoginAt: number;
+}
+
+export interface OAuthStateRecord {
+  stateHash: string;
+  codeVerifierEnc: string | null;
+  purpose: 'login' | 'link' | 'private_install';
+  userId: string | null;
+  redirectAfter: string;
+  createdAt: number;
+  expiresAt: number;
+  usedAt: number | null;
+}
+
+export interface GithubAppInstallationRecord {
+  userId: string;
+  installationId: string;
+  accountLogin: string;
+  accessTokenEnc: string;
+  tokenExpiresAt: number;
+  createdAt: number;
+  lastUsedAt: number | null;
+  revokedAt: number | null;
 }
 
 export interface SessionRecord {
@@ -117,7 +150,7 @@ function toStoredUser(row: Record<string, unknown> | undefined): StoredUser | un
     name: String(row.name),
     role: String(row.role),
     emailVerifiedAt: row.email_verified_at == null ? null : Number(row.email_verified_at),
-    passwordHash: String(row.password_hash),
+    passwordHash: row.password_hash == null ? null : String(row.password_hash),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
     failedLogins: Number(row.failed_logins),
@@ -203,6 +236,316 @@ export function insertUser(user: Pick<StoredUser, 'id' | 'email' | 'name' | 'rol
     }
     throw error;
   }
+}
+
+function toOAuthAccountRecord(row: Record<string, unknown> | undefined): OAuthAccountRecord | undefined {
+  if (!row) return undefined;
+  return {
+    id: String(row.id),
+    userId: String(row.user_id),
+    provider: 'github',
+    providerUserId: String(row.provider_user_id),
+    providerLogin: String(row.provider_login),
+    avatarUrl: row.avatar_url == null ? null : String(row.avatar_url),
+    createdAt: Number(row.created_at),
+    lastLoginAt: Number(row.last_login_at),
+  };
+}
+
+function toOAuthStateRecord(row: Record<string, unknown> | undefined): OAuthStateRecord | undefined {
+  if (!row) return undefined;
+  return {
+    stateHash: String(row.state_hash),
+    codeVerifierEnc: row.code_verifier_enc == null ? null : String(row.code_verifier_enc),
+    purpose: String(row.purpose) as OAuthStateRecord['purpose'],
+    userId: row.user_id == null ? null : String(row.user_id),
+    redirectAfter: String(row.redirect_after),
+    createdAt: Number(row.created_at),
+    expiresAt: Number(row.expires_at),
+    usedAt: row.used_at == null ? null : Number(row.used_at),
+  };
+}
+
+function toGithubAppInstallationRecord(
+  row: Record<string, unknown> | undefined
+): GithubAppInstallationRecord | undefined {
+  if (!row) return undefined;
+  return {
+    userId: String(row.user_id),
+    installationId: String(row.installation_id),
+    accountLogin: String(row.account_login),
+    accessTokenEnc: String(row.access_token_enc),
+    tokenExpiresAt: Number(row.token_expires_at),
+    createdAt: Number(row.created_at),
+    lastUsedAt: row.last_used_at == null ? null : Number(row.last_used_at),
+    revokedAt: row.revoked_at == null ? null : Number(row.revoked_at),
+  };
+}
+
+export function createOAuthUser(
+  user: { id: string; email: string; name: string; role: string; emailVerifiedAt: number },
+  account: {
+    id: string;
+    providerUserId: string;
+    providerLogin: string;
+    avatarUrl: string | null;
+    now: number;
+  }
+): 'created' | 'email_exists' | 'oauth_account_exists' {
+  const db = getDatabase();
+  const create = db.transaction(() => {
+    const now = account.now;
+    const inserted = db.prepare(`
+      INSERT OR IGNORE INTO users (
+        id, email, name, role, email_verified_at, password_hash, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+    `).run(
+      user.id,
+      user.email.trim().toLowerCase(),
+      user.name.trim(),
+      user.role,
+      user.emailVerifiedAt,
+      now,
+      now
+    );
+    if (inserted.changes === 0) return 'email_exists' as const;
+    db.prepare(`
+      INSERT INTO oauth_accounts (
+        id, user_id, provider, provider_user_id, provider_login, avatar_url, created_at, last_login_at
+      ) VALUES (?, ?, 'github', ?, ?, ?, ?, ?)
+    `).run(
+      account.id,
+      user.id,
+      account.providerUserId,
+      account.providerLogin,
+      account.avatarUrl,
+      now,
+      now
+    );
+    return 'created' as const;
+  });
+  try {
+    return create();
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('UNIQUE constraint failed: oauth_accounts.')) {
+      return 'oauth_account_exists';
+    }
+    throw error;
+  }
+}
+
+export function findOAuthAccount(providerUserId: string): {
+  account: OAuthAccountRecord;
+  user: StoredUser;
+} | undefined {
+  const row = getDatabase().prepare(`
+    SELECT oauth_accounts.id AS oauth_id,
+           oauth_accounts.user_id AS oauth_user_id,
+           oauth_accounts.provider_user_id,
+           oauth_accounts.provider_login,
+           oauth_accounts.avatar_url,
+           oauth_accounts.created_at AS oauth_created_at,
+           oauth_accounts.last_login_at,
+           users.email,
+           users.name,
+           users.role,
+           users.email_verified_at,
+           users.password_hash,
+           users.created_at AS user_created_at,
+           users.updated_at AS user_updated_at,
+           users.failed_logins,
+           users.locked_until,
+           users.deleted_at
+    FROM oauth_accounts
+    JOIN users ON users.id = oauth_accounts.user_id
+    WHERE oauth_accounts.provider = 'github'
+      AND oauth_accounts.provider_user_id = ?
+      AND users.deleted_at IS NULL
+  `).get(providerUserId) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  const account = toOAuthAccountRecord({
+    id: row.oauth_id,
+    user_id: row.oauth_user_id,
+    provider_user_id: row.provider_user_id,
+    provider_login: row.provider_login,
+    avatar_url: row.avatar_url,
+    created_at: row.oauth_created_at,
+    last_login_at: row.last_login_at,
+  })!;
+  const user = toStoredUser({
+    id: row.oauth_user_id,
+    email: row.email,
+    name: row.name,
+    role: row.role,
+    email_verified_at: row.email_verified_at,
+    password_hash: row.password_hash,
+    created_at: row.user_created_at,
+    updated_at: row.user_updated_at,
+    failed_logins: row.failed_logins,
+    locked_until: row.locked_until,
+    deleted_at: row.deleted_at,
+  })!;
+  return { account, user };
+}
+
+export function getOAuthAccountForUser(userId: string): OAuthAccountRecord | undefined {
+  const row = getDatabase()
+    .prepare("SELECT * FROM oauth_accounts WHERE user_id = ? AND provider = 'github'")
+    .get(userId) as Record<string, unknown> | undefined;
+  return toOAuthAccountRecord(row);
+}
+
+export function refreshOAuthAccount(
+  providerUserId: string,
+  providerLogin: string,
+  avatarUrl: string | null,
+  now: number
+): void {
+  getDatabase().prepare(`
+    UPDATE oauth_accounts
+    SET provider_login = ?, avatar_url = ?, last_login_at = ?
+    WHERE provider = 'github' AND provider_user_id = ?
+  `).run(providerLogin, avatarUrl, now, providerUserId);
+}
+
+export function linkOAuthAccount(account: {
+  id: string;
+  userId: string;
+  providerUserId: string;
+  providerLogin: string;
+  avatarUrl: string | null;
+  now: number;
+}): boolean {
+  try {
+    getDatabase().prepare(`
+      INSERT INTO oauth_accounts (
+        id, user_id, provider, provider_user_id, provider_login, avatar_url, created_at, last_login_at
+      ) VALUES (?, ?, 'github', ?, ?, ?, ?, ?)
+    `).run(
+      account.id,
+      account.userId,
+      account.providerUserId,
+      account.providerLogin,
+      account.avatarUrl,
+      account.now,
+      account.now
+    );
+    return true;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('UNIQUE constraint failed: oauth_accounts.')) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+export function unlinkOAuthAccount(userId: string): boolean {
+  return getDatabase()
+    .prepare("DELETE FROM oauth_accounts WHERE user_id = ? AND provider = 'github'")
+    .run(userId).changes > 0;
+}
+
+export function deleteUserAccount(userId: string): boolean {
+  return getDatabase().prepare('DELETE FROM users WHERE id = ?').run(userId).changes > 0;
+}
+
+export function createOAuthState(state: OAuthStateRecord): void {
+  getDatabase().prepare(`
+    INSERT INTO oauth_states (
+      state_hash, code_verifier_enc, purpose, user_id, redirect_after, created_at, expires_at, used_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    state.stateHash,
+    state.codeVerifierEnc,
+    state.purpose,
+    state.userId,
+    state.redirectAfter,
+    state.createdAt,
+    state.expiresAt,
+    state.usedAt
+  );
+}
+
+export function consumeOAuthState(stateHash: string, now: number): OAuthStateRecord | undefined {
+  const db = getDatabase();
+  const consume = db.transaction(() => {
+    const row = db.prepare(`
+      SELECT * FROM oauth_states
+      WHERE state_hash = ? AND used_at IS NULL AND expires_at > ?
+    `).get(stateHash, now) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    const updated = db.prepare(`
+      UPDATE oauth_states SET used_at = ?
+      WHERE state_hash = ? AND used_at IS NULL AND expires_at > ?
+    `).run(now, stateHash, now);
+    if (updated.changes !== 1) return undefined;
+    return toOAuthStateRecord({ ...row, used_at: now });
+  });
+  return consume();
+}
+
+export function saveGithubAppInstallation(installation: GithubAppInstallationRecord): void {
+  getDatabase().prepare(`
+    INSERT INTO github_app_installations (
+      user_id, installation_id, account_login, access_token_enc, token_expires_at,
+      created_at, last_used_at, revoked_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+    ON CONFLICT(user_id, installation_id) DO UPDATE SET
+      account_login = excluded.account_login,
+      access_token_enc = excluded.access_token_enc,
+      token_expires_at = excluded.token_expires_at,
+      last_used_at = excluded.last_used_at,
+      revoked_at = NULL
+  `).run(
+    installation.userId,
+    installation.installationId,
+    installation.accountLogin,
+    installation.accessTokenEnc,
+    installation.tokenExpiresAt,
+    installation.createdAt,
+    installation.lastUsedAt
+  );
+}
+
+export function getGithubAppInstallation(
+  userId: string,
+  installationId: string
+): GithubAppInstallationRecord | undefined {
+  const row = getDatabase().prepare(`
+    SELECT * FROM github_app_installations
+    WHERE user_id = ? AND installation_id = ? AND revoked_at IS NULL
+  `).get(userId, installationId) as Record<string, unknown> | undefined;
+  return toGithubAppInstallationRecord(row);
+}
+
+export function listGithubAppInstallations(userId: string): GithubAppInstallationRecord[] {
+  const rows = getDatabase().prepare(`
+    SELECT * FROM github_app_installations
+    WHERE user_id = ? AND revoked_at IS NULL
+    ORDER BY created_at DESC
+  `).all(userId) as Record<string, unknown>[];
+  return rows.map((row) => toGithubAppInstallationRecord(row)!);
+}
+
+export function updateGithubAppInstallationToken(
+  userId: string,
+  installationId: string,
+  accessTokenEnc: string,
+  tokenExpiresAt: number,
+  now: number
+): boolean {
+  return getDatabase().prepare(`
+    UPDATE github_app_installations
+    SET access_token_enc = ?, token_expires_at = ?, last_used_at = ?
+    WHERE user_id = ? AND installation_id = ? AND revoked_at IS NULL
+  `).run(accessTokenEnc, tokenExpiresAt, now, userId, installationId).changes > 0;
+}
+
+export function revokeGithubAppInstallation(userId: string, installationId: string, now: number): boolean {
+  return getDatabase().prepare(`
+    UPDATE github_app_installations SET revoked_at = ?, access_token_enc = ''
+    WHERE user_id = ? AND installation_id = ? AND revoked_at IS NULL
+  `).run(now, userId, installationId).changes > 0;
 }
 
 export function recordFailedLogin(

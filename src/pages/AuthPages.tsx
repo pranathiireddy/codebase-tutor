@@ -1,12 +1,68 @@
-import React, { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import React, { useEffect, useState } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { TopNav } from '../components/TopNav';
 import { useApp } from '../context/AppContext';
 import { apiFetch, safeJson } from '../utils/api';
 import type { UserProfile } from '../types/codebase';
 
+function GitHubSignInOption({ redirectAfter }: { redirectAfter: '/login' | '/signup' }) {
+  const [enabled, setEnabled] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void apiFetch('/api/auth/github/config')
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = await safeJson<{ enabled?: boolean }>(res);
+        if (active) setEnabled(data.enabled === true);
+      })
+      .catch(() => {
+        if (active) setEnabled(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  if (!enabled) return null;
+  return (
+    <div className="space-y-2 border-t border-[#232832] pt-4">
+      <a
+        href={`/api/auth/github/start?redirect_after=${encodeURIComponent(redirectAfter)}`}
+        className="block w-full rounded-md border border-[#3B414D] px-4 py-2 text-center text-xs font-semibold text-[#E6E9EF] hover:border-sky-500 hover:text-sky-300"
+      >
+        Continue with GitHub
+      </a>
+      <p className="text-center text-[11px] text-[#9CA3AF]">
+        We only read your name, avatar and verified email
+      </p>
+    </div>
+  );
+}
+
+function githubErrorMessage(reason: string | null): string | null {
+  if (!reason) return null;
+  const messages: Record<string, string> = {
+    access_denied: 'GitHub authorization was denied.',
+    unverified_email: 'Add a primary verified email to your GitHub account, then try again.',
+    existing_email: 'That verified email already has an account. Sign in with your password first, then connect GitHub in Settings.',
+    expired_attempt: 'That GitHub sign-in attempt expired or could not be verified. Please try again.',
+    invalid_code: 'GitHub could not complete sign-in. Please try again.',
+    invalid_profile: 'GitHub returned an incomplete profile. Please try again.',
+    provider_error: 'GitHub could not complete sign-in. Please try again.',
+    pkce_rejected: 'GitHub rejected PKCE for this application. Contact the site administrator.',
+    github_account_linked: 'That GitHub account is already connected to another account.',
+    github_already_linked: 'A different GitHub account is already connected. Disconnect it first.',
+    session_changed: 'Your sign-in session changed. Sign in again before connecting GitHub.',
+    private_access_denied: 'GitHub App access was not granted.',
+    private_install_failed: 'The GitHub App could not be verified. Try again or contact the site administrator.',
+  };
+  return messages[reason] ?? 'GitHub could not complete the request. Please try again.';
+}
+
 export function LoginPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { setSession } = useApp();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -47,6 +103,12 @@ export function LoginPage() {
               Access your workspace preferences and imported repositories.
             </p>
           </div>
+
+          {githubErrorMessage(searchParams.get('github_error')) && (
+            <div className="rounded border border-rose-500/30 bg-rose-500/10 p-2.5 text-xs text-rose-300">
+              {githubErrorMessage(searchParams.get('github_error'))}
+            </div>
+          )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-1.5">
@@ -94,6 +156,8 @@ export function LoginPage() {
             </button>
           </form>
 
+          <GitHubSignInOption redirectAfter="/login" />
+
           <p className="text-center text-xs text-[#9CA3AF]">
             New to Codebase Tutor?{' '}
             <Link to="/signup" className="text-sky-400 hover:text-sky-300">
@@ -108,6 +172,7 @@ export function LoginPage() {
 
 export function SignupPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { setSession } = useApp();
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -150,6 +215,12 @@ export function SignupPage() {
               Save your learning workspace preferences.
             </p>
           </div>
+
+          {githubErrorMessage(searchParams.get('github_error')) && (
+            <div className="rounded border border-rose-500/30 bg-rose-500/10 p-2.5 text-xs text-rose-300">
+              {githubErrorMessage(searchParams.get('github_error'))}
+            </div>
+          )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-1.5">
@@ -229,6 +300,8 @@ export function SignupPage() {
               {loading ? 'Creating account...' : 'Create account'}
             </button>
           </form>
+
+          <GitHubSignInOption redirectAfter="/signup" />
 
           <p className="text-center text-xs text-[#9CA3AF]">
             Already have an account?{' '}

@@ -89,7 +89,7 @@ export function parseGitHubUrl(rawInput: string): ParsedGitHubRepo {
       throw new Error('Only HTTPS GitHub URLs are supported.');
     }
     if (parsed.hostname.toLowerCase() !== 'github.com' && parsed.hostname.toLowerCase() !== 'www.github.com') {
-      throw new Error('Only public github.com repository URLs are supported.');
+      throw new Error('Only github.com repository URLs are supported.');
     }
 
     const segments = parsed.pathname.split('/').filter(Boolean);
@@ -190,7 +190,7 @@ export async function fetchGitHubRepoMetadata(
     throw new Error(
       cleanToken
         ? `Repository "${repo.fullName}" was not found or your GitHub token lacks access.`
-        : `Repository "${repo.fullName}" was not found on GitHub or is private. Add a GitHub token in Settings if it is private.`
+        : `Repository "${repo.fullName}" was not found on GitHub or is private. Connect read-only GitHub App access or add a GitHub token in Settings if it is private.`
     );
   }
   if (res.status === 401) {
@@ -201,7 +201,7 @@ export async function fetchGitHubRepoMetadata(
     if (remaining === '0') {
       throw new Error('GitHub API rate limit reached. Please add your GitHub Personal Access Token in Settings.');
     }
-    throw new Error(`Access denied while fetching "${repo.fullName}". Private repositories require a GitHub token with repo access.`);
+    throw new Error(`Access denied while fetching "${repo.fullName}". Connect read-only GitHub App access or provide a GitHub token with repository access.`);
   }
   if (!res.ok) {
     throw new Error(`GitHub returned status ${res.status} for "${repo.fullName}".`);
@@ -216,7 +216,7 @@ export async function fetchGitHubRepoMetadata(
   };
 
   if (data.private && !tokenOverride?.trim()) {
-    throw new Error(`"${repo.fullName}" is a private repository. Add your GitHub Personal Access Token in Settings to explore it.`);
+    throw new Error(`"${repo.fullName}" is a private repository. Connect read-only GitHub App access or add a GitHub token in Settings to explore it.`);
   }
   if ((data.size ?? 0) > 150_000) {
     throw new Error(`Repository "${repo.fullName}" exceeds the 150 MB analysis limit.`);

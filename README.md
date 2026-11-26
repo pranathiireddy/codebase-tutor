@@ -41,3 +41,11 @@ npm run lint
 See `.env.example` for every environment variable and its purpose, including chat-history limits. In production, set `APP_ENCRYPTION_KEY` to a 32-byte hexadecimal value and provide `ALLOWED_ORIGINS`. If enabling the server Gemini key, set both `ALLOW_SERVER_KEY=true` and `GEMINI_API_KEY`.
 
 The SQLite database defaults to `.codebase-tutor-cache/codebase-tutor.sqlite`; repository cache files are stored under `.codebase-tutor-cache/` as well. Both are excluded from Git.
+
+## GitHub sign-in and private repositories
+
+GitHub sign-in is optional. Create a GitHub OAuth App and set `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, and `GITHUB_REDIRECT_URI` in `.env`. Configure the OAuth App's callback URL to exactly match `GITHUB_REDIRECT_URI` (for local development, `http://localhost:3000/api/auth/github/callback`). The app requests only `read:user user:email`. Set `APP_ENCRYPTION_KEY` to a random 32-byte hexadecimal value to enable the sign-in flow; the login button stays hidden until the required configuration is present.
+
+Private repository access is separate from sign-in and uses a GitHub App. Create an App with **Contents: read-only** repository permission, set its App ID, slug, and private key in `GITHUB_APP_ID`, `GITHUB_APP_SLUG`, and `GITHUB_APP_PRIVATE_KEY`, and set the App's Setup URL to the exact `GITHUB_APP_SETUP_URI` value (for local development, `http://localhost:3000/api/auth/github-app/callback`). The user explicitly authorizes this access in Settings. Installation tokens are encrypted with `APP_ENCRYPTION_KEY`, kept server-side, and revocable from Settings. Private repository analysis remains memory-only and is not written to the cache or database. The OAuth App used for sign-in does not request the `repo` scope.
+
+Do not commit either app's credentials or private keys. `.env.example` lists the provider variables and their purpose.

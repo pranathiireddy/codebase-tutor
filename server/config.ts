@@ -6,6 +6,11 @@ const booleanFromEnv = z
   .default('false')
   .transform((value) => value === 'true');
 
+const optionalTrimmedString = z.preprocess(
+  (value) => (typeof value === 'string' && value.trim() ? value.trim() : undefined),
+  z.string().optional()
+);
+
 const configSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
@@ -31,6 +36,16 @@ const configSchema = z.object({
     .default('http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173'),
   GEMINI_API_KEY: z.string().trim().optional(),
   GITHUB_TOKEN: z.string().trim().optional(),
+  GITHUB_OAUTH_CLIENT_ID: optionalTrimmedString,
+  GITHUB_OAUTH_CLIENT_SECRET: optionalTrimmedString,
+  GITHUB_REDIRECT_URI: optionalTrimmedString,
+  GITHUB_APP_ID: optionalTrimmedString,
+  GITHUB_APP_SLUG: optionalTrimmedString,
+  GITHUB_APP_PRIVATE_KEY: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() ? value.replace(/\\n/g, '\n').trim() : undefined),
+    z.string().optional()
+  ),
+  GITHUB_APP_SETUP_URI: optionalTrimmedString,
 });
 
 const parsed = configSchema.safeParse(process.env);
@@ -66,6 +81,61 @@ if (env.ALLOW_SERVER_KEY && !env.GEMINI_API_KEY) {
   throw new Error('Invalid environment configuration: GEMINI_API_KEY is required when ALLOW_SERVER_KEY=true.');
 }
 
+function validateConfiguredUri(name: string, value: string | undefined): void {
+  if (!value) return;
+  let parsedUri: URL;
+  try {
+    parsedUri = new URL(value);
+  } catch {
+    throw new Error(`Invalid environment configuration: ${name} must be an absolute URL.`);
+  }
+  if (parsedUri.protocol !== 'https:' && !(env.NODE_ENV !== 'production' && parsedUri.hostname === 'localhost')) {
+    throw new Error(`Invalid environment configuration: ${name} must use HTTPS outside localhost development.`);
+  }
+}
+
+validateConfiguredUri('GITHUB_REDIRECT_URI', env.GITHUB_REDIRECT_URI);
+validateConfiguredUri('GITHUB_APP_SETUP_URI', env.GITHUB_APP_SETUP_URI);
+
+if (env.GITHUB_REDIRECT_URI) {
+  const redirectUri = new URL(env.GITHUB_REDIRECT_URI);
+  if (
+    redirectUri.pathname !== '/api/auth/github/callback' ||
+    redirectUri.search ||
+    redirectUri.hash
+  ) {
+    throw new Error(
+      'Invalid environment configuration: GITHUB_REDIRECT_URI must exactly target /api/auth/github/callback without query or fragment.'
+    );
+  }
+}
+if (env.GITHUB_APP_SETUP_URI) {
+  const setupUri = new URL(env.GITHUB_APP_SETUP_URI);
+  if (
+    setupUri.pathname !== '/api/auth/github-app/callback' ||
+    setupUri.search ||
+    setupUri.hash
+  ) {
+    throw new Error(
+      'Invalid environment configuration: GITHUB_APP_SETUP_URI must exactly target /api/auth/github-app/callback without query or fragment.'
+    );
+  }
+}
+
+const githubOAuthConfigured = Boolean(
+  env.GITHUB_OAUTH_CLIENT_ID &&
+    env.GITHUB_OAUTH_CLIENT_SECRET &&
+    env.GITHUB_REDIRECT_URI &&
+    env.APP_ENCRYPTION_KEY
+);
+const githubAppConfigured = Boolean(
+  env.GITHUB_APP_ID &&
+    env.GITHUB_APP_SLUG &&
+    env.GITHUB_APP_PRIVATE_KEY &&
+    env.GITHUB_APP_SETUP_URI &&
+    env.APP_ENCRYPTION_KEY
+);
+
 export const config = Object.freeze({
   nodeEnv: env.NODE_ENV,
   port: env.PORT,
@@ -85,4 +155,13 @@ export const config = Object.freeze({
   allowedOrigins: Object.freeze(allowedOrigins),
   geminiApiKey: env.GEMINI_API_KEY,
   githubToken: env.GITHUB_TOKEN,
+  githubOAuthClientId: env.GITHUB_OAUTH_CLIENT_ID,
+  githubOAuthClientSecret: env.GITHUB_OAUTH_CLIENT_SECRET,
+  githubRedirectUri: env.GITHUB_REDIRECT_URI,
+  githubOAuthConfigured,
+  githubAppId: env.GITHUB_APP_ID,
+  githubAppSlug: env.GITHUB_APP_SLUG,
+  githubAppPrivateKey: env.GITHUB_APP_PRIVATE_KEY,
+  githubAppSetupUri: env.GITHUB_APP_SETUP_URI,
+  githubAppConfigured,
 });
