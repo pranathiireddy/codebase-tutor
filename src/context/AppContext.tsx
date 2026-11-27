@@ -1,17 +1,12 @@
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
 import type { DiagramType, UserProfile } from '../types/codebase';
+import { apiFetch, safeJson } from '../utils/api';
 
 export interface WorkspacePreferences {
   editorFontSize: number;
   defaultDiagramType: DiagramType;
   showMinimap: boolean;
-}
-
-export interface UserApiCredentials {
-  geminiApiKey: string;
-  geminiModel: string;
-  githubToken: string;
-  githubDefaultOwner: string;
+  chatRetentionDays: number;
 }
 
 export interface CredentialStatus {
@@ -23,126 +18,156 @@ export interface CredentialStatus {
 
 interface AppContextValue {
   user: UserProfile | null;
-  authToken: string | null;
-  setSession: (user: UserProfile | null, token: string | null) => void;
+  authLoading: boolean;
+  setSession: (user: UserProfile | null) => void;
   logout: () => Promise<void>;
   preferences: WorkspacePreferences;
   updatePreferences: (partial: Partial<WorkspacePreferences>) => void;
-  credentials: UserApiCredentials;
-  updateCredentials: (partial: Partial<UserApiCredentials>) => void;
-  clearCredentials: () => void;
+  preferencesError: string | null;
   credentialStatus: CredentialStatus;
   setCredentialStatus: (status: CredentialStatus) => void;
 }
 
 const SESSION_CREDS_KEY = 'codebase_tutor_session_creds_v1';
 
-const DEFAULT_CREDENTIALS: UserApiCredentials = {
-  geminiApiKey: '',
-  geminiModel: 'gemini-4-hydrogen',
-  githubToken: '',
-  githubDefaultOwner: '',
+const DEFAULT_PREFERENCES: WorkspacePreferences = {
+  editorFontSize: 13,
+  defaultDiagramType: 'system_architecture',
+  showMinimap: true,
+  chatRetentionDays: 0,
 };
-
-function loadInitialCredentials(): UserApiCredentials {
-  try {
-    if (typeof window === 'undefined' || !window.sessionStorage) return DEFAULT_CREDENTIALS;
-    const raw = window.sessionStorage.getItem(SESSION_CREDS_KEY);
-    if (!raw) return DEFAULT_CREDENTIALS;
-    const parsed = JSON.parse(raw) as Partial<UserApiCredentials>;
-    return {
-      geminiApiKey: typeof parsed.geminiApiKey === 'string' ? parsed.geminiApiKey : '',
-      geminiModel:
-        typeof parsed.geminiModel === 'string' && parsed.geminiModel.trim()
-          ? parsed.geminiModel
-          : DEFAULT_CREDENTIALS.geminiModel,
-      githubToken: typeof parsed.githubToken === 'string' ? parsed.githubToken : '',
-      githubDefaultOwner: typeof parsed.githubDefaultOwner === 'string' ? parsed.githubDefaultOwner : '',
-    };
-  } catch {
-    return DEFAULT_CREDENTIALS;
-  }
-}
-
-function saveSessionCredentials(creds: UserApiCredentials): void {
-  try {
-    if (typeof window === 'undefined' || !window.sessionStorage) return;
-    if (!creds.geminiApiKey && !creds.githubToken && !creds.githubDefaultOwner && creds.geminiModel === DEFAULT_CREDENTIALS.geminiModel) {
-      window.sessionStorage.removeItem(SESSION_CREDS_KEY);
-    } else {
-      window.sessionStorage.setItem(SESSION_CREDS_KEY, JSON.stringify(creds));
-    }
-  } catch {
-    // ignore storage quota / privacy mode errors
-  }
-}
 
 const AppContext = createContext<AppContextValue | undefined>(undefined);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<UserProfile | null>(null);
-  const [authToken, setAuthToken] = useState<string | null>(null);
-  const [preferences, setPreferences] = useState<WorkspacePreferences>({
-    editorFontSize: 13,
-    defaultDiagramType: 'system_architecture',
-    showMinimap: true,
-  });
-  const [credentials, setCredentials] = useState<UserApiCredentials>(loadInitialCredentials);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [preferences, setPreferences] = useState<WorkspacePreferences>(DEFAULT_PREFERENCES);
+  const [preferencesOwner, setPreferencesOwner] = useState<string | null>(null);
+  const [preferencesError, setPreferencesError] = useState<string | null>(null);
   const [credentialStatus, setCredentialStatus] = useState<CredentialStatus>({
     geminiVerified: null,
     githubVerified: null,
   });
 
-  const setSession = useCallback((nextUser: UserProfile | null, nextToken: string | null) => {
+  useEffect(() => {
+    try {
+      window.sessionStorage.removeItem(SESSION_CREDS_KEY);
+    } catch {
+      // Storage may be unavailable in restricted browser contexts.
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void apiFetch('/api/auth/me')
+      .then(async (res) => {
+        if (res.status === 401) {
+          if (!cancelled) {
+            setUser(null);
+            setCredentialStatus({ geminiVerified: null, githubVerified: null });
+          }
+          return { user: undefined };
+        }
+        return safeJson<{ user?: UserProfile }>(res);
+      })
+      .then((response) => {
+        if (!cancelled && response.user) {
+          setUser(response.user);
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setAuthLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setPreferencesOwner(null);
+    if (!user) {
+      setPreferences(DEFAULT_PREFERENCES);
+      setPreferencesError(null);
+      return;
+    }
+
+    void apiFetch('/api/preferences')
+      .then(async (res) => {
+        const payload = await safeJson<{ preferences?: WorkspacePreferences; error?: string }>(res);
+        if (!res.ok || !payload.preferences) {
+          throw new Error(payload.error || 'Unable to load your preferences.');
+        }
+        if (!cancelled) {
+          setPreferences(payload.preferences);
+          setPreferencesOwner(user.id);
+          setPreferencesError(null);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setPreferencesError(error instanceof Error ? error.message : 'Unable to load your preferences.');
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  useEffect(() => {
+    if (!user || preferencesOwner !== user.id) return;
+    const timer = setTimeout(() => {
+      void apiFetch('/api/preferences', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(preferences),
+      })
+        .then(async (res) => {
+          const payload = await safeJson<{ error?: string }>(res);
+          if (!res.ok) throw new Error(payload.error || 'Unable to save your preferences.');
+          setPreferencesError(null);
+        })
+        .catch((error: unknown) => {
+          setPreferencesError(error instanceof Error ? error.message : 'Unable to save your preferences.');
+        });
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [preferences, preferencesOwner, user]);
+
+  const setSession = useCallback((nextUser: UserProfile | null) => {
     setUser(nextUser);
-    setAuthToken(nextToken);
+    setAuthLoading(false);
+    setCredentialStatus({ geminiVerified: null, githubVerified: null });
   }, []);
 
   const logout = useCallback(async () => {
-    if (authToken) {
-      try {
-        await fetch('/api/auth/logout', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
-      } catch {
-        // ignore network error on logout
-      }
+    try {
+      await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // Local state is cleared even if the server is unreachable.
     }
     setUser(null);
-    setAuthToken(null);
-  }, [authToken]);
+    setCredentialStatus({ geminiVerified: null, githubVerified: null });
+  }, []);
 
   const updatePreferences = useCallback((partial: Partial<WorkspacePreferences>) => {
     setPreferences((prev) => ({ ...prev, ...partial }));
-  }, []);
-
-  const updateCredentials = useCallback((partial: Partial<UserApiCredentials>) => {
-    setCredentials((prev) => {
-      const next = { ...prev, ...partial };
-      saveSessionCredentials(next);
-      return next;
-    });
-  }, []);
-
-  const clearCredentials = useCallback(() => {
-    setCredentials(DEFAULT_CREDENTIALS);
-    saveSessionCredentials(DEFAULT_CREDENTIALS);
-    setCredentialStatus({ geminiVerified: null, githubVerified: null });
   }, []);
 
   return (
     <AppContext.Provider
       value={{
         user,
-        authToken,
+        authLoading,
         setSession,
         logout,
         preferences,
         updatePreferences,
-        credentials,
-        updateCredentials,
-        clearCredentials,
+        preferencesError,
         credentialStatus,
         setCredentialStatus,
       }}

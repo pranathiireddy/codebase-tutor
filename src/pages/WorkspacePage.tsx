@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   Code2,
   Compass,
+  Home,
   Network,
   Plus,
   RefreshCw,
@@ -20,13 +21,15 @@ import { SourceCodePanel } from '../components/SourceCodePanel';
 import { DiagramExplorerPanel } from '../components/DiagramExplorerPanel';
 import { OverviewWalkthroughPanel } from '../components/OverviewWalkthroughPanel';
 import { useApp } from '../context/AppContext';
-import { ApiHtmlFallbackError, buildApiHeaders, safeJson } from '../utils/api';
-import { generateClientFallbackExplanation } from '../utils/clientTutorFallback';
+import { apiFetch, safeJson } from '../utils/api';
 import type {
   AnalyzedFileMeta,
   ChatCitation,
   ChatContext,
+  ChatMessageCursor,
   ChatMessage,
+  ChatProgress,
+  ChatRecord,
   CodeAttachment,
   DiagramType,
   DiagramVisualEdge,
@@ -41,12 +44,46 @@ import type {
 
 type ExplorationMode = 'overview' | 'code' | 'diagrams';
 
-export function WorkspacePage() {
+export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
   const { repositoryId } = useParams<{ repositoryId?: string }>();
   const navigate = useNavigate();
-  const { preferences, credentials, updateCredentials, setCredentialStatus } = useApp();
+  const { preferences, user, setCredentialStatus } = useApp();
 
   const targetRepoId = repositoryId || 'dietrichgebert__ponytail';
+  const [hasCustomGeminiKey, setHasCustomGeminiKey] = useState(false);
+  const [geminiKeyStatusError, setGeminiKeyStatusError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!user || readOnly) {
+      setHasCustomGeminiKey(false);
+      setGeminiKeyStatusError(null);
+      return;
+    }
+    setGeminiKeyStatusError(null);
+    void apiFetch('/api/settings/keys')
+      .then(async (res) => {
+        const payload = await safeJson<{ keys?: Array<{ provider: string }> }>(res);
+        if (!res.ok) throw new Error('Unable to load saved API key status.');
+        if (res.ok && !cancelled) {
+          setHasCustomGeminiKey(payload.keys?.some((key) => key.provider === 'gemini') ?? false);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setGeminiKeyStatusError(
+            error instanceof TypeError
+              ? 'The server is unavailable; saved key status could not be loaded.'
+              : error instanceof Error
+                ? error.message
+                : 'Unable to load saved API key status.'
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user, readOnly]);
 
   const [repositories, setRepositories] = useState<RepositoryRecord[]>([]);
   const [repository, setRepository] = useState<RepositoryRecord | null>(null);
@@ -72,6 +109,17 @@ export function WorkspacePage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
   const [attachedCode, setAttachedCode] = useState<CodeAttachment | undefined>(undefined);
+  const [chats, setChats] = useState<ChatRecord[]>([]);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [loadingChats, setLoadingChats] = useState(false);
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [nextMessageCursor, setNextMessageCursor] = useState<ChatMessageCursor | undefined>();
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [exploredItemIds, setExploredItemIds] = useState<Set<string>>(new Set());
+  const [completedTourSteps, setCompletedTourSteps] = useState<Set<number>>(new Set());
+  const [progressError, setProgressError] = useState<string | null>(null);
+  const activeChatIdRef = useRef<string | null>(null);
 
   // Quick import modal
   const [showImportModal, setShowImportModal] = useState(false);
@@ -128,7 +176,7 @@ export function WorkspacePage() {
   // Load repository list
   const loadRepoList = useCallback(async () => {
     try {
-      const res = await fetch('/api/repositories');
+      const res = await apiFetch('/api/repositories');
       if (res.ok) {
         const json = await safeJson<{ repositories: RepositoryRecord[] }>(res);
         setRepositories(json.repositories);
@@ -136,7 +184,7 @@ export function WorkspacePage() {
     } catch {
       // ignore
     }
-  }, []);
+  }, [apiFetch]);
 
   // Poll target repository analysis until ready
   useEffect(() => {
@@ -144,6 +192,7 @@ export function WorkspacePage() {
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     // Reset selection when switching repo
+    setRepository(null);
     setSelectedFilePath(null);
     setFileData(null);
     setHighlightRange(null);
@@ -153,17 +202,19 @@ export function WorkspacePage() {
     fileContentCacheRef.current.clear();
     setMessages([]);
     setAttachedCode(undefined);
+    setChats([]);
+    setActiveChatId(null);
+    activeChatIdRef.current = null;
+    setHasMoreMessages(false);
+    setNextMessageCursor(undefined);
+    setChatError(null);
+    setExploredItemIds(new Set());
+    setCompletedTourSteps(new Set());
+    setProgressError(null);
 
     async function loadAnalysis() {
       try {
-        const res = await fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/analysis`);
-        if (res.status === 404 && targetRepoId === 'dietrichgebert__ponytail') {
-          await fetch('/api/repositories/analyze', {
-            method: 'POST',
-            headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ url: 'https://github.com/DietrichGebert/ponytail' }),
-          });
-        }
+        const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/analysis`);
         if (res.ok) {
           const json = await safeJson<{ repository: RepositoryRecord }>(res);
           if (cancelled) return;
@@ -171,8 +222,8 @@ export function WorkspacePage() {
 
           if (json.repository.stage === 'ready') {
             const [filesRes, graphRes] = await Promise.all([
-              fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/files`),
-              fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/graph`),
+              apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/files`),
+              apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/graph`),
             ]);
             if (filesRes.ok && !cancelled) {
               const filesJson = await safeJson<{
@@ -222,7 +273,268 @@ export function WorkspacePage() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [targetRepoId, loadRepoList]);
+  }, [targetRepoId, loadRepoList, apiFetch]);
+
+  const loadChatMessages = useCallback(
+    async (chatId: string, cursor?: ChatMessageCursor, prepend = false) => {
+      const params = new URLSearchParams({ limit: '50' });
+      if (cursor) {
+        params.set('beforeCreatedAt', String(cursor.createdAt));
+        params.set('beforeId', cursor.id);
+      }
+      const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}/messages?${params}`);
+      const payload = await safeJson<{
+        messages: ChatMessage[];
+        hasMore: boolean;
+        nextCursor?: ChatMessageCursor;
+        error?: string;
+      }>(res);
+      if (!res.ok) throw new Error(payload.error || 'Unable to load chat messages.');
+      if (activeChatIdRef.current === chatId) {
+        setMessages((current) => (prepend ? [...payload.messages, ...current] : payload.messages));
+        setHasMoreMessages(payload.hasMore);
+        setNextMessageCursor(payload.nextCursor);
+        setChatError(null);
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (readOnly || repository?.id !== targetRepoId || repository.stage !== 'ready') return;
+    let cancelled = false;
+    setLoadingChats(true);
+    async function loadWorkspaceHistory() {
+      try {
+        const [chatsResult, progressResult] = await Promise.allSettled([
+          apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/chats`),
+          apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/progress`),
+        ]);
+        if (chatsResult.status === 'rejected') throw chatsResult.reason;
+        const chatsRes = chatsResult.value;
+        const chatsPayload = await safeJson<{ chats?: ChatRecord[]; error?: string }>(chatsRes);
+        if (!chatsRes.ok || !chatsPayload.chats) {
+          throw new Error(chatsPayload.error || 'Unable to load repository chats.');
+        }
+        if (cancelled) return;
+        setChats(chatsPayload.chats);
+        if (progressResult.status === 'rejected') {
+          setProgressError(
+            progressResult.reason instanceof Error
+              ? progressResult.reason.message
+              : 'Unable to load learning progress.'
+          );
+        } else {
+          try {
+            const progressPayload = await safeJson<ChatProgress & { error?: string }>(progressResult.value);
+            if (!progressResult.value.ok) {
+              throw new Error(progressPayload.error || 'Unable to load learning progress.');
+            }
+            setExploredItemIds(new Set(progressPayload.exploredItems));
+            setCompletedTourSteps(
+              new Set(progressPayload.tourProgress.filter((item) => item.tourId === 'overview').map((item) => item.stepIndex))
+            );
+            setProgressError(null);
+          } catch (error) {
+            setProgressError(error instanceof Error ? error.message : 'Unable to load learning progress.');
+          }
+        }
+        const activeChat = chatsPayload.chats[0];
+        setActiveChatId(activeChat?.id ?? null);
+        activeChatIdRef.current = activeChat?.id ?? null;
+        if (activeChat) await loadChatMessages(activeChat.id);
+        else setMessages([]);
+      } catch (error) {
+        if (!cancelled) {
+          setChatError(error instanceof Error ? error.message : 'Unable to load saved workspace data.');
+        }
+      } finally {
+        if (!cancelled) setLoadingChats(false);
+      }
+    }
+    void loadWorkspaceHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, [readOnly, repository?.id, repository?.stage, targetRepoId, loadChatMessages]);
+
+  const loadOlderMessages = useCallback(async () => {
+    if (!activeChatId || !nextMessageCursor || loadingOlderMessages) return;
+    setLoadingOlderMessages(true);
+    try {
+      await loadChatMessages(activeChatId, nextMessageCursor, true);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Unable to load older messages.');
+    } finally {
+      setLoadingOlderMessages(false);
+    }
+  }, [activeChatId, nextMessageCursor, loadingOlderMessages, loadChatMessages]);
+
+  const markFileExplored = useCallback(
+    async (filePath: string) => {
+      const nodeId = `file:${filePath}`;
+      if (readOnly || exploredItemIds.has(nodeId)) return;
+      setExploredItemIds((current) => new Set(current).add(nodeId));
+      setProgressError(null);
+      try {
+        const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/progress/explored`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nodeId }),
+        });
+        const payload = await safeJson<{ error?: string }>(res);
+        if (!res.ok) throw new Error(payload.error || 'Unable to save file progress.');
+      } catch (error) {
+        setProgressError(error instanceof Error ? error.message : 'Unable to save file progress.');
+      }
+    },
+    [readOnly, exploredItemIds, targetRepoId, apiFetch]
+  );
+
+  const markTourStepComplete = useCallback(
+    async (stepIndex: number) => {
+      if (readOnly || completedTourSteps.has(stepIndex)) return;
+      setCompletedTourSteps((current) => new Set(current).add(stepIndex));
+      setProgressError(null);
+      try {
+        const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/progress/tours`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tourId: 'overview', stepIndex }),
+        });
+        const payload = await safeJson<{ error?: string }>(res);
+        if (!res.ok) throw new Error(payload.error || 'Unable to save walkthrough progress.');
+      } catch (error) {
+        setProgressError(error instanceof Error ? error.message : 'Unable to save walkthrough progress.');
+      }
+    },
+    [readOnly, completedTourSteps, targetRepoId, apiFetch]
+  );
+
+  useEffect(() => {
+    if (selectedFilePath && repository?.stage === 'ready') void markFileExplored(selectedFilePath);
+  }, [selectedFilePath, repository?.stage, markFileExplored]);
+
+  const createChat = useCallback(async (): Promise<ChatRecord | null> => {
+    setChatError(null);
+    try {
+      const res = await apiFetch('/api/chats', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repositoryId: targetRepoId, title: 'New chat' }),
+      });
+      const payload = await safeJson<{ chat?: ChatRecord; error?: string }>(res);
+      if (!res.ok || !payload.chat) throw new Error(payload.error || 'Unable to create chat.');
+      setChats((current) => [payload.chat!, ...current]);
+      setActiveChatId(payload.chat.id);
+      activeChatIdRef.current = payload.chat.id;
+      setMessages([]);
+      setHasMoreMessages(false);
+      setNextMessageCursor(undefined);
+      return payload.chat;
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Unable to create chat.');
+      return null;
+    }
+  }, [targetRepoId, apiFetch]);
+
+  const selectChat = useCallback(
+    async (chatId: string) => {
+      setActiveChatId(chatId);
+      activeChatIdRef.current = chatId;
+      setMessages([]);
+      setChatError(null);
+      try {
+        await loadChatMessages(chatId);
+      } catch (error) {
+        setChatError(error instanceof Error ? error.message : 'Unable to load chat.');
+      }
+    },
+    [loadChatMessages]
+  );
+
+  const renameChat = useCallback(
+    async (chatId: string, title: string) => {
+      try {
+        const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title }),
+        });
+        const payload = await safeJson<{ chat?: ChatRecord; error?: string }>(res);
+        if (!res.ok || !payload.chat) throw new Error(payload.error || 'Unable to rename chat.');
+        setChats((current) => current.map((chat) => (chat.id === chatId ? payload.chat! : chat)));
+        setChatError(null);
+      } catch (error) {
+        setChatError(error instanceof Error ? error.message : 'Unable to rename chat.');
+      }
+    },
+    [apiFetch]
+  );
+
+  const deleteChat = useCallback(
+    async (chatId: string) => {
+      try {
+        const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+        const payload = await safeJson<{ error?: string }>(res);
+        if (!res.ok) throw new Error(payload.error || 'Unable to delete chat.');
+        const remaining = chats.filter((chat) => chat.id !== chatId);
+        setChats(remaining);
+        if (activeChatIdRef.current === chatId) {
+          const nextChat = remaining[0];
+          setActiveChatId(nextChat?.id ?? null);
+          activeChatIdRef.current = nextChat?.id ?? null;
+          setMessages([]);
+          setHasMoreMessages(false);
+          setNextMessageCursor(undefined);
+          if (nextChat) await loadChatMessages(nextChat.id);
+        }
+        setChatError(null);
+      } catch (error) {
+        setChatError(error instanceof Error ? error.message : 'Unable to delete chat.');
+      }
+    },
+    [chats, loadChatMessages, apiFetch]
+  );
+
+  const clearChats = useCallback(async () => {
+    try {
+      const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/chats`, {
+        method: 'DELETE',
+      });
+      const payload = await safeJson<{ error?: string }>(res);
+      if (!res.ok) throw new Error(payload.error || 'Unable to clear repository chats.');
+      setChats([]);
+      setActiveChatId(null);
+      activeChatIdRef.current = null;
+      setMessages([]);
+      setHasMoreMessages(false);
+      setNextMessageCursor(undefined);
+      setChatError(null);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Unable to clear repository chats.');
+    }
+  }, [targetRepoId, apiFetch]);
+
+  const exportChat = useCallback(
+    async (chatId: string, format: 'json' | 'markdown') => {
+      try {
+        const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}/export?format=${format}`);
+        const payload = await safeJson<{ fileName: string; contentType: string; content: string; error?: string }>(res);
+        if (!res.ok) throw new Error(payload.error || 'Unable to export chat.');
+        const url = URL.createObjectURL(new Blob([payload.content], { type: payload.contentType }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = payload.fileName;
+        link.click();
+        URL.revokeObjectURL(url);
+        setChatError(null);
+      } catch (error) {
+        setChatError(error instanceof Error ? error.message : 'Unable to export chat.');
+      }
+    },
+    [apiFetch]
+  );
 
   // Fetch file content whenever selectedFilePath changes
   useEffect(() => {
@@ -239,7 +551,7 @@ export function WorkspacePage() {
     async function fetchContent() {
       setFileLoading(true);
       try {
-        const res = await fetch(
+        const res = await apiFetch(
           `/api/repositories/${encodeURIComponent(targetRepoId)}/files/content?path=${encodeURIComponent(selectedFilePath!)}`
         );
         if (res.ok) {
@@ -258,7 +570,7 @@ export function WorkspacePage() {
     return () => {
       cancelled = true;
     };
-  }, [targetRepoId, selectedFilePath, repository?.stage]);
+  }, [targetRepoId, selectedFilePath, repository?.stage, apiFetch]);
 
   const openCodeLocation = useCallback(
     (filePath: string, startLine?: number, endLine?: number, symbolId?: string) => {
@@ -289,7 +601,7 @@ export function WorkspacePage() {
       const cached = fileContentCacheRef.current.get(filePath);
       if (cached) return cached;
       try {
-        const res = await fetch(
+        const res = await apiFetch(
           `/api/repositories/${encodeURIComponent(targetRepoId)}/files/content?path=${encodeURIComponent(filePath)}`
         );
         if (!res.ok) return null;
@@ -300,7 +612,7 @@ export function WorkspacePage() {
         return null;
       }
     },
-    [targetRepoId]
+    [targetRepoId, apiFetch]
   );
 
   const handleTraceCode = useCallback(
@@ -415,7 +727,7 @@ export function WorkspacePage() {
       let nodesToSearch = graphNodes;
       if (nodesToSearch.length === 0) {
         try {
-          const gRes = await fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/graph`);
+          const gRes = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/graph`);
           if (gRes.ok) {
             const gJson = await safeJson<{ graph?: KnowledgeGraph }>(gRes);
             if (gJson.graph?.nodes) {
@@ -518,7 +830,7 @@ export function WorkspacePage() {
       if (traceQuery.length >= 2) {
         try {
           const preferred = selectedFilePath || citations?.[0]?.file_path || '';
-          const traceRes = await fetch(
+          const traceRes = await apiFetch(
             `/api/repositories/${encodeURIComponent(targetRepoId)}/trace?q=${encodeURIComponent(traceQuery)}&preferredFile=${encodeURIComponent(preferred)}`
           );
           if (traceRes.ok) {
@@ -575,7 +887,16 @@ export function WorkspacePage() {
 
       return false;
     },
-    [filesMeta, selectedFilePath, fileData, graphNodes, targetRepoId, openCodeLocation, loadFileContentCached]
+    [
+      filesMeta,
+      selectedFilePath,
+      fileData,
+      graphNodes,
+      targetRepoId,
+      openCodeLocation,
+      loadFileContentCached,
+      apiFetch,
+    ]
   );
 
   const handleSelectFile = useCallback((filePath: string) => {
@@ -621,10 +942,12 @@ export function WorkspacePage() {
   const sendQuestion = useCallback(
     async (
       question: string,
-      overrideContext?: ChatContext,
-      overrideCreds?: typeof credentials
+      overrideContext?: ChatContext
     ) => {
-      const credsToUse = overrideCreds ?? credentials;
+      if (readOnly) {
+        navigate('/login');
+        return;
+      }
       const ctxToUse = overrideContext ?? currentChatContext;
       const contextLabels: string[] = [];
       if (ctxToUse.selectedNodeName) contextLabels.push(ctxToUse.selectedNodeName);
@@ -644,76 +967,62 @@ export function WorkspacePage() {
         contextLabel: contextLabels.join(' · ') || undefined,
       };
 
-      const nextHistory = [...messages, userMsg];
-      setMessages(nextHistory);
+      setMessages((current) => [...current, userMsg]);
       setChatLoading(true);
+      let chatId = activeChatIdRef.current;
 
       try {
+        if (!chatId) {
+          const createdChat = await createChat();
+          if (!createdChat) throw new Error('Unable to create a chat for this question.');
+          chatId = createdChat.id;
+        }
         let json: {
           answer?: string;
           citations?: ChatMessage['citations'];
           confidenceSummary?: ChatMessage['confidenceSummary'];
           modelUsed?: string;
+          userMessage?: ChatMessage;
+          assistantMessage?: ChatMessage;
           error?: string;
         };
 
-        try {
-          const res = await fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/chat`, {
-            method: 'POST',
-            headers: buildApiHeaders(credsToUse, { 'Content-Type': 'application/json' }),
-            body: JSON.stringify({
-              question,
-              context: ctxToUse,
-              history: messages
-                .filter((m) => !m.error && m.content.trim().length > 0)
-                .map((m) => ({ role: m.role, content: m.content })),
-            }),
-          });
-          json = await safeJson<typeof json>(res);
+        const res = await apiFetch(`/api/chats/${encodeURIComponent(chatId)}/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question,
+            contextLabel: contextLabels.join(' · '),
+            context: ctxToUse,
+          }),
+        });
+        json = await safeJson<typeof json>(res);
 
-          if (!res.ok) {
-            throw new Error(json.error || 'Unable to generate explanation.');
-          }
-        } catch (backendErr) {
-          // If preview/static host served HTML instead of the backend /api route, fall back to direct Gemini call
-          if (backendErr instanceof ApiHtmlFallbackError && repository) {
-            json = await generateClientFallbackExplanation({
-              repository,
-              filesMeta,
-              fileData,
-              question,
-              context: ctxToUse,
-              history: messages
-                .filter((m) => !m.error && m.content.trim().length > 0)
-                .map((m) => ({ role: m.role, content: m.content })),
-              apiKey: credsToUse.geminiApiKey,
-              model: credsToUse.geminiModel,
-            });
-          } else {
-            throw backendErr;
-          }
+        if (!res.ok) {
+          throw new Error(json.error || 'Unable to generate explanation.');
         }
 
-        if (
-          credsToUse.geminiApiKey.trim() &&
-          json.modelUsed &&
-          json.modelUsed !== credsToUse.geminiModel
-        ) {
-          updateCredentials({ geminiModel: json.modelUsed });
+        if (!json.userMessage || !json.assistantMessage) {
+          throw new Error('The server returned an incomplete chat response.');
         }
 
-        const assistantMsg: ChatMessage = {
-          id: `a_${Date.now()}`,
-          role: 'assistant',
-          content: json.answer || 'No explanation generated.',
-          timestamp: new Date().toISOString(),
-          citations: json.citations,
-          confidenceSummary: json.confidenceSummary,
-        };
-        setMessages((prev) => [...prev, assistantMsg]);
+        if (activeChatIdRef.current === chatId) {
+          setMessages((current) => [
+            ...current.filter((message) => message.id !== userMsg.id),
+            json.userMessage!,
+            json.assistantMessage!,
+          ]);
+        }
+        setChats((current) =>
+          current.map((chat) =>
+            chat.id === chatId
+              ? { ...chat, title: chat.title === 'New chat' ? question.slice(0, 80) : chat.title, updatedAt: Date.now() }
+              : chat
+          )
+        );
 
         // Automatically highlight primary cited code if user is in code mode or no lines highlighted
-        if (json.citations && json.citations[0] && explorationMode === 'code') {
+        if (activeChatIdRef.current === chatId && json.citations && json.citations[0] && explorationMode === 'code') {
           setSelectedFilePath(json.citations[0].file_path);
           setHighlightRange({
             start_line: json.citations[0].start_line,
@@ -721,104 +1030,97 @@ export function WorkspacePage() {
           });
         }
       } catch (err) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `err_${Date.now()}`,
-            role: 'assistant',
-            content: '',
-            timestamp: new Date().toISOString(),
-            error: err instanceof Error ? err.message : 'Chat request failed.',
-          },
-        ]);
+        if (!chatId || activeChatIdRef.current === chatId) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `err_${Date.now()}`,
+              role: 'assistant',
+              content: '',
+              timestamp: new Date().toISOString(),
+              error: err instanceof Error ? err.message : 'Chat request failed.',
+            },
+          ]);
+        }
       } finally {
         setChatLoading(false);
       }
     },
     [
       currentChatContext,
-      messages,
-      targetRepoId,
       explorationMode,
-      credentials,
-      updateCredentials,
-      repository,
-      filesMeta,
-      fileData,
+      readOnly,
+      navigate,
+      createChat,
+      apiFetch,
     ]
   );
 
   const handleQuickApplyGeminiKey = useCallback(
     async (apiKey: string, retryQuestion?: string): Promise<string | null> => {
       try {
-        let resolvedModel = credentials.geminiModel;
-        try {
-          const res = await fetch('/api/settings/verify', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              geminiApiKey: apiKey,
-              geminiModel: credentials.geminiModel,
-            }),
-          });
-          const json = await safeJson<{
-            gemini?: { valid: boolean; model: string; note?: string; error?: string };
-            error?: string;
-          }>(res);
-          if (!res.ok) {
-            return json.error || 'Failed to verify Gemini API key.';
-          }
-          if (!json.gemini?.valid) {
-            return json.gemini?.error || 'Gemini API key verification failed.';
-          }
-          resolvedModel = json.gemini.model || credentials.geminiModel;
-        } catch (verifyErr) {
-          if (!(verifyErr instanceof ApiHtmlFallbackError)) {
-            throw verifyErr;
-          }
-        }
-
-        const nextCreds = {
-          ...credentials,
-          geminiApiKey: apiKey,
-          geminiModel: resolvedModel,
-        };
-        updateCredentials({
-          geminiApiKey: nextCreds.geminiApiKey,
-          geminiModel: nextCreds.geminiModel,
+        const model = 'gemini-4-hydrogen';
+        const res = await apiFetch('/api/settings/keys/gemini/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            value: apiKey,
+            model,
+          }),
         });
+        const json = await safeJson<{
+          valid?: boolean;
+          model?: string;
+          error?: string;
+          note?: string;
+        }>(res);
+        if (!res.ok) {
+          return json.error || 'Failed to verify Gemini API key.';
+        }
+        if (!json.valid) {
+          return json.error || 'Gemini API key verification failed.';
+        }
+        const resolvedModel = json.model || model;
+        const saveResponse = await apiFetch('/api/settings/keys/gemini', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: apiKey, model: resolvedModel }),
+        });
+        const saved = await safeJson<{ error?: string }>(saveResponse);
+        if (!saveResponse.ok) return saved.error || 'Gemini API key could not be saved.';
+        setHasCustomGeminiKey(true);
         setCredentialStatus({
           geminiVerified: true,
-          geminiMessage: `Verified (${nextCreds.geminiModel})`,
+          geminiMessage: `Verified (${resolvedModel})`,
           githubVerified: null,
         });
         if (retryQuestion) {
-          void sendQuestion(retryQuestion, undefined, nextCreds);
+          void sendQuestion(retryQuestion);
         }
         return null;
       } catch (err) {
-        return err instanceof Error ? err.message : 'Verification failed.';
+        return err instanceof TypeError
+          ? 'Unable to reach the server. Your key was not saved; check the connection and try again.'
+          : err instanceof Error
+            ? err.message
+            : 'Verification failed.';
       }
     },
-    [credentials, updateCredentials, setCredentialStatus, sendQuestion]
+    [setCredentialStatus, sendQuestion]
   );
 
   const handleQuickImport = async (e: React.FormEvent) => {
     e.preventDefault();
-    setImportError(null);
-    let targetInput = importUrl.trim();
-    if (
-      credentials.githubDefaultOwner.trim() &&
-      targetInput &&
-      !targetInput.includes('/') &&
-      !targetInput.includes(':')
-    ) {
-      targetInput = `${credentials.githubDefaultOwner.trim()}/${targetInput}`;
+    if (readOnly) {
+      navigate('/login');
+      return;
     }
+    setImportError(null);
+    const targetInput = importUrl.trim();
     try {
-      const res = await fetch('/api/repositories/analyze', {
+      const res = await apiFetch('/api/repositories/analyze', {
         method: 'POST',
-        headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: targetInput }),
       });
       const json = await safeJson<{ repository?: RepositoryRecord; error?: string }>(res);
@@ -834,13 +1136,17 @@ export function WorkspacePage() {
   };
 
   const handleRetryAnalysis = async () => {
+    if (readOnly) {
+      navigate('/login');
+      return;
+    }
     if (!repository) return;
-    await fetch('/api/repositories/analyze', {
+    await apiFetch('/api/repositories/analyze', {
       method: 'POST',
-      headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: repository.url, forceRefresh: true }),
     });
-    const res = await fetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/analysis`);
+    const res = await apiFetch(`/api/repositories/${encodeURIComponent(targetRepoId)}/analysis`);
     if (res.ok) {
       const json = await safeJson<{ repository: RepositoryRecord }>(res);
       setRepository(json.repository);
@@ -863,7 +1169,7 @@ export function WorkspacePage() {
           return;
         }
         try {
-          const res = await fetch(
+          const res = await apiFetch(
             `/api/repositories/${encodeURIComponent(targetRepoId)}/files/content?path=${encodeURIComponent(att.file_path)}`
           );
           if (res.ok) {
@@ -881,7 +1187,7 @@ export function WorkspacePage() {
         }
       }
     },
-    [fileData, targetRepoId]
+    [fileData, targetRepoId, apiFetch]
   );
 
   return (
@@ -915,14 +1221,14 @@ export function WorkspacePage() {
             )}
           </select>
 
-          <button
+          {!readOnly && <button
             type="button"
             onClick={() => setShowImportModal(true)}
             className="inline-flex items-center gap-1 rounded border border-[#232832] bg-[#161A21] px-2 py-1 text-[11px] font-medium text-[#D1D5DB] hover:border-sky-500/50 cursor-pointer whitespace-nowrap shrink-0"
           >
             <Plus className="h-3 w-3" />
             <span>Import Repo</span>
-          </button>
+          </button>}
 
           {repository?.commitSha && (
             <span className="hidden lg:inline font-mono text-[11px] tabular-nums text-[#6B7280] whitespace-nowrap">
@@ -1013,14 +1319,14 @@ export function WorkspacePage() {
           </h2>
           <p className="max-w-md text-xs text-rose-300">{repository.error || repository.stageMessage}</p>
           <div className="flex items-center gap-3">
-            <button
+            {!readOnly && <button
               type="button"
               onClick={() => void handleRetryAnalysis()}
               className="inline-flex items-center gap-1.5 rounded-md bg-sky-500 px-3.5 py-2 text-xs font-semibold text-[#0B0D10] hover:bg-sky-400 cursor-pointer"
             >
               <RefreshCw className="h-3.5 w-3.5" />
               <span>Retry Analysis</span>
-            </button>
+            </button>}
             <Link
               to="/"
               className="rounded-md border border-[#232832] px-3.5 py-2 text-xs text-[#D1D5DB] hover:text-white"
@@ -1057,36 +1363,72 @@ export function WorkspacePage() {
                   <Files className="h-4 w-4" />
                 </button>
               )}
-              <Link
-                to="/settings"
-                title="Settings"
-                aria-label="Settings"
-                className="mt-auto rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
-              >
-                <Settings className="h-4 w-4" />
-              </Link>
+              <div className="mt-auto flex flex-col gap-1">
+                <Link
+                  to="/"
+                  title="Home"
+                  aria-label="Home"
+                  className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
+                >
+                  <Home className="h-4 w-4" />
+                </Link>
+                {!readOnly && <Link
+                  to="/settings"
+                  title="Settings"
+                  aria-label="Settings"
+                  className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
+                >
+                  <Settings className="h-4 w-4" />
+                </Link>}
+              </div>
             </div>
           )}
 
           {/* Panel A: Chat */}
           {!chatCollapsed && (
             <div style={{ width: `${leftWidth}%` }} className="h-full min-w-[240px] shrink-0">
-              <ChatPanel
+              {readOnly ? (
+                <div className="flex h-full flex-col items-center justify-center gap-3 border-r border-[#232832] bg-[#111419] p-6 text-center">
+                  <MessageSquare className="h-6 w-6 text-sky-400" />
+                  <h2 className="text-sm font-semibold text-[#F3F4F6]">Explore the featured demo</h2>
+                  <p className="text-xs leading-relaxed text-[#9CA3AF]">
+                    Sign in to ask questions, import repositories, and use your own API keys.
+                  </p>
+                  <Link
+                    to="/login"
+                    className="rounded-md bg-sky-500 px-3.5 py-2 text-xs font-semibold text-[#0B0D10] hover:bg-sky-400"
+                  >
+                    Sign in
+                  </Link>
+                </div>
+              ) : <ChatPanel
                 repositoryName={repository.name}
                 onCollapse={() => setChatCollapsed(true)}
                 messages={messages}
                 loading={chatLoading}
                 context={currentChatContext}
-                credentials={credentials}
-                hasCustomGeminiKey={Boolean(credentials.geminiApiKey.trim())}
+                hasCustomGeminiKey={hasCustomGeminiKey}
+                keyStatusError={geminiKeyStatusError ?? undefined}
                 onQuickApplyGeminiKey={handleQuickApplyGeminiKey}
                 onClearAttachedCode={() => setAttachedCode(undefined)}
                 onAttachCode={(att) => void handleAttachCode(att)}
                 onSendMessage={(q) => void sendQuestion(q)}
-                onClearChat={() => setMessages([])}
+                onClearChat={() => void clearChats()}
+                chats={chats}
+                activeChatId={activeChatId}
+                loadingChats={loadingChats}
+                chatError={chatError}
+                hasMoreMessages={hasMoreMessages}
+                loadingOlderMessages={loadingOlderMessages}
+                onCreateChat={() => void createChat()}
+                onSelectChat={(chatId) => void selectChat(chatId)}
+                onRenameChat={(chatId, title) => void renameChat(chatId, title)}
+                onDeleteChat={(chatId) => void deleteChat(chatId)}
+                onExportChat={(chatId, format) => void exportChat(chatId, format)}
+                onLoadOlderMessages={() => void loadOlderMessages()}
                 onOpenCitation={(fp, s, e) => openCodeLocation(fp, s, e)}
                 onTraceCode={handleTraceCode}
-              />
+              />}
             </div>
           )}
 
@@ -1105,10 +1447,17 @@ export function WorkspacePage() {
           {/* Panel B: File Explorer */}
           {!filesCollapsed && (
             <div style={{ width: `${midWidth}%` }} className="h-full min-w-[200px] shrink-0">
+              {progressError && (
+                <p role="alert" className="border-b border-rose-900/50 bg-rose-950/30 px-3 py-2 text-[11px] text-rose-300">
+                  {progressError}
+                </p>
+              )}
               <FileExplorerPanel
                 tree={tree}
                 filesMeta={filesMeta}
                 selectedFilePath={selectedFilePath}
+                exploredItemIds={exploredItemIds}
+                exploredCount={exploredItemIds.size}
                 onSelectFile={handleSelectFile}
                 onCollapse={() => setFilesCollapsed(true)}
                 incomingDeps={fileData?.incomingDependencies ?? []}
@@ -1134,8 +1483,12 @@ export function WorkspacePage() {
             {explorationMode === 'diagrams' ? (
               <DiagramExplorerPanel
                 repositoryId={repository.id}
+                filesMeta={filesMeta}
                 activeDiagramType={activeDiagramType}
-                onChangeDiagramType={setActiveDiagramType}
+                onChangeDiagramType={(type) => {
+                  setActiveDiagramType(type);
+                  setSelectedGraphNodeId(null);
+                }}
                 selectedGraphNodeId={selectedGraphNodeId}
                 onSelectGraphNode={handleSelectDiagramNode}
                 onOpenCodeLocation={openCodeLocation}
@@ -1178,6 +1531,8 @@ export function WorkspacePage() {
                   setExplorationMode('diagrams');
                 }}
                 onAskQuestion={(q) => void sendQuestion(q)}
+                completedSteps={completedTourSteps}
+                onCompleteStep={(stepIndex) => void markTourStepComplete(stepIndex)}
               />
             )}
           </div>

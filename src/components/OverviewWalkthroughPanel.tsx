@@ -1,4 +1,4 @@
-import { PlayCircle, ArrowRight, Layers, FolderTree, Compass, ShieldAlert } from 'lucide-react';
+import { PlayCircle, ArrowRight, Layers, FolderTree, Compass, ShieldAlert, CheckCircle2 } from 'lucide-react';
 import type { DiagramType, RepositoryRecord } from '../types/codebase';
 
 interface OverviewWalkthroughPanelProps {
@@ -6,6 +6,8 @@ interface OverviewWalkthroughPanelProps {
   onOpenCodeLocation: (filePath: string, startLine?: number, endLine?: number) => void;
   onOpenDiagram: (type: DiagramType) => void;
   onAskQuestion: (q: string) => void;
+  completedSteps: ReadonlySet<number>;
+  onCompleteStep: (stepIndex: number) => void;
 }
 
 export function OverviewWalkthroughPanel({
@@ -13,6 +15,8 @@ export function OverviewWalkthroughPanel({
   onOpenCodeLocation,
   onOpenDiagram,
   onAskQuestion,
+  completedSteps,
+  onCompleteStep,
 }: OverviewWalkthroughPanelProps) {
   const overview = repository.overview;
   if (!overview) {
@@ -92,10 +96,12 @@ export function OverviewWalkthroughPanel({
           <section className="space-y-3">
             <div className="flex items-center gap-2">
               <Compass className="h-4 w-4 text-sky-400" />
-              <h3 className="text-sm font-semibold text-[#F3F4F6]">Guided Repository Walkthrough</h3>
+              <h3 className="text-sm font-semibold text-[#F3F4F6]">
+                Guided Repository Walkthrough · {completedSteps.size}/{overview.walkthrough.length} complete
+              </h3>
             </div>
             <div className="space-y-2">
-              {overview.walkthrough.map((step) => (
+              {overview.walkthrough.map((step, index) => (
                 <div
                   key={step.id}
                   className="flex flex-col gap-2 rounded-lg border border-[#232832] bg-[#111419] p-4 sm:flex-row sm:items-center sm:justify-between"
@@ -106,9 +112,15 @@ export function OverviewWalkthroughPanel({
                     <div className="font-mono text-[11px] text-sky-400">{step.file_path}</div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
+                    {completedSteps.has(index) && (
+                      <CheckCircle2 aria-label="Completed" className="h-4 w-4 text-emerald-400" />
+                    )}
                     <button
                       type="button"
-                      onClick={() => onOpenCodeLocation(step.file_path, step.start_line, step.end_line)}
+                      onClick={() => {
+                        onOpenCodeLocation(step.file_path, step.start_line, step.end_line);
+                        onCompleteStep(index);
+                      }}
                       className="rounded border border-[#232832] bg-[#161A21] px-2.5 py-1.5 text-xs font-medium text-[#E6E9EF] hover:border-sky-500/50 cursor-pointer whitespace-nowrap"
                     >
                       Open Code

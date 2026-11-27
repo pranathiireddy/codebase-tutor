@@ -14,6 +14,7 @@ import {
   ArrowDownLeft,
   ArrowUpRight,
   PanelLeftClose,
+  CheckCircle2,
 } from 'lucide-react';
 import type { AnalyzedFileMeta, FileRole, FileTreeNode, GraphEdgeType } from '../types/codebase';
 
@@ -22,6 +23,8 @@ interface FileExplorerPanelProps {
   tree: FileTreeNode[];
   filesMeta: AnalyzedFileMeta[];
   selectedFilePath: string | null;
+  exploredItemIds: ReadonlySet<string>;
+  exploredCount: number;
   onSelectFile: (filePath: string) => void;
   incomingDeps: { file_path: string; relationship: GraphEdgeType; line?: number }[];
   outgoingDeps: { file_path: string; relationship: GraphEdgeType; line?: number }[];
@@ -59,6 +62,7 @@ function TreeBranch({
   node,
   depth,
   selectedFilePath,
+  exploredItemIds,
   expandedDirs,
   onToggleDir,
   onSelectFile,
@@ -66,6 +70,7 @@ function TreeBranch({
   node: FileTreeNode;
   depth: number;
   selectedFilePath: string | null;
+  exploredItemIds: ReadonlySet<string>;
   expandedDirs: Set<string>;
   onToggleDir: (path: string) => void;
   onSelectFile: (path: string) => void;
@@ -99,6 +104,7 @@ function TreeBranch({
               node={child}
               depth={depth + 1}
               selectedFilePath={selectedFilePath}
+              exploredItemIds={exploredItemIds}
               expandedDirs={expandedDirs}
               onToggleDir={onToggleDir}
               onSelectFile={onSelectFile}
@@ -109,6 +115,7 @@ function TreeBranch({
   }
 
   const isSelected = selectedFilePath === node.path;
+  const isExplored = exploredItemIds.has(`file:${node.path}`);
   return (
     <button
       type="button"
@@ -125,13 +132,16 @@ function TreeBranch({
         {getFileIcon(node.name, node.role)}
         <span className="truncate">{node.name}</span>
       </span>
-      {node.isEntryPoint ? (
-        <span className="text-[10px] text-sky-400 shrink-0">entry</span>
-      ) : (node.symbolCount ?? 0) > 0 ? (
-        <span className="font-mono text-[10px] tabular-nums text-[#6B7280] shrink-0">
-          {node.symbolCount}
-        </span>
-      ) : null}
+      <span className="flex items-center gap-1.5 shrink-0">
+        {isExplored && <CheckCircle2 aria-label="Explored" className="h-3 w-3 text-emerald-400" />}
+        {node.isEntryPoint ? (
+          <span className="text-[10px] text-sky-400">entry</span>
+        ) : (node.symbolCount ?? 0) > 0 ? (
+          <span className="font-mono text-[10px] tabular-nums text-[#6B7280]">
+            {node.symbolCount}
+          </span>
+        ) : null}
+      </span>
     </button>
   );
 }
@@ -141,6 +151,8 @@ export function FileExplorerPanel({
   tree,
   filesMeta,
   selectedFilePath,
+  exploredItemIds,
+  exploredCount,
   onSelectFile,
   incomingDeps,
   outgoingDeps,
@@ -195,6 +207,9 @@ export function FileExplorerPanel({
             <span className="font-mono text-[11px] tabular-nums text-[#6B7280]">
               {filesMeta.length} files
             </span>
+            <span className="font-mono text-[10px] tabular-nums text-emerald-400">
+              {exploredCount}/{filesMeta.length} explored
+            </span>
             <button
               type="button"
               onClick={onCollapse}
@@ -248,6 +263,7 @@ export function FileExplorerPanel({
           ) : (
             filteredList.map((f) => {
               const isSel = selectedFilePath === f.path;
+              const isExplored = exploredItemIds.has(`file:${f.path}`);
               return (
                 <button
                   key={f.path}
@@ -262,7 +278,10 @@ export function FileExplorerPanel({
                       {getFileIcon(f.name, f.role)}
                       <span className="truncate">{f.name}</span>
                     </span>
-                    <span className="text-[10px] text-[#6B7280] shrink-0">{f.language}</span>
+                    <span className="flex items-center gap-1 text-[10px] text-[#6B7280] shrink-0">
+                      {f.language}
+                      {isExplored && <CheckCircle2 aria-label="Explored" className="h-3 w-3 text-emerald-400" />}
+                    </span>
                   </div>
                   <span className="truncate pl-5 font-mono text-[10px] text-[#6B7280]">{f.path}</span>
                 </button>
@@ -276,6 +295,7 @@ export function FileExplorerPanel({
               node={node}
               depth={0}
               selectedFilePath={selectedFilePath}
+              exploredItemIds={exploredItemIds}
               expandedDirs={expandedDirs}
               onToggleDir={toggleDir}
               onSelectFile={onSelectFile}

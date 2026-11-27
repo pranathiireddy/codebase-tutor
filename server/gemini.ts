@@ -1,14 +1,28 @@
+import crypto from 'node:crypto';
 import { GoogleGenAI, Type } from '@google/genai';
 import type { ChatCitation, ChatContext } from '../src/types/codebase.ts';
 import type { AnalyzedRepoData } from './repoStore.ts';
 import { retrieveRepositoryEvidence } from './retriever.ts';
+import { config } from './config.ts';
+import { redactSecrets } from './redaction.ts';
 
-let cachedAi: GoogleGenAI | null = null;
-let cachedApiKey: string | null = null;
-let serverKeyRejected = false;
+interface GeminiClientEntry {
+  text: GoogleGenAI;
+  tts: GoogleGenAI;
+  expiresAt: number;
+}
+
+const CLIENT_CACHE_LIMIT = 16;
+const CLIENT_CACHE_TTL_MS = 5 * 60 * 1000;
+const REJECTION_TTL_MS = 30 * 60 * 1000;
+const GEMINI_VERIFICATION_TIMEOUT_MS = 15000;
+const MAX_GEMINI_VERIFICATION_MODELS = 3;
+const clientCache = new Map<string, GeminiClientEntry>();
+const rejectedKeyFingerprints = new Map<string, number>();
 
 const ALLOWED_MODEL_RE = /^[a-z0-9][a-z0-9._-]{1,63}$/i;
 const DEFAULT_MODEL = 'gemini-4-hydrogen';
+const DEFAULT_VERIFICATION_MODEL = 'gemini-2.5-flash-lite';
 const PUBLIC_FALLBACK_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
@@ -16,9 +30,53 @@ const PUBLIC_FALLBACK_MODELS = [
   'gemini-2.5-pro',
   'gemini-3.1-flash-lite',
 ];
+const PREFERRED_TEXT_MODELS = [
+  'gemini-4-hydrogen',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-3-flash-preview',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-pro',
+];
+const PREFERRED_VERIFICATION_MODELS = [
+  'gemini-2.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-3-flash-preview',
+  'gemini-2.5-pro',
+];
 
-export function isServerGeminiKeyRejected(): boolean {
-  return serverKeyRejected;
+function keyFingerprint(apiKey: string): string {
+  return crypto.createHash('sha256').update(apiKey).digest('hex');
+}
+
+function getRejectedAt(fingerprint: string): number | undefined {
+  const rejectedAt = rejectedKeyFingerprints.get(fingerprint);
+  if (rejectedAt === undefined) return undefined;
+  if (Date.now() - rejectedAt >= REJECTION_TTL_MS) {
+    rejectedKeyFingerprints.delete(fingerprint);
+    return undefined;
+  }
+  return rejectedAt;
+}
+
+function markKeyRejected(fingerprint: string): void {
+  rejectedKeyFingerprints.delete(fingerprint);
+  rejectedKeyFingerprints.set(fingerprint, Date.now());
+  while (rejectedKeyFingerprints.size > 64) {
+    const oldest = rejectedKeyFingerprints.keys().next().value;
+    if (oldest === undefined) break;
+    rejectedKeyFingerprints.delete(oldest);
+  }
+}
+
+function markKeyAccepted(fingerprint: string): void {
+  rejectedKeyFingerprints.delete(fingerprint);
+}
+
+export function isServerGeminiKeyRejected(apiKey = config.geminiApiKey): boolean {
+  const clean = sanitizeKey(apiKey);
+  return Boolean(clean && getRejectedAt(keyFingerprint(clean)));
 }
 
 function resolveModel(modelOverride?: string): string {
@@ -62,32 +120,69 @@ function createTtsGenAIClient(apiKey: string, isServerKey: boolean): GoogleGenAI
   return new GoogleGenAI({ apiKey, apiVersion: 'v1beta' });
 }
 
-function getGeminiClient(apiKeyOverride?: string): { ai: GoogleGenAI; isServerKey: boolean } {
-  const custom = sanitizeKey(apiKeyOverride);
-  const envKey = sanitizeKey(process.env.GEMINI_API_KEY);
-  const isServerKey = !custom;
-  const apiKey = custom || envKey;
-
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error('GEMINI_API_KEY is not configured. Please enter your Gemini API key in Settings.');
+function getClientEntry(apiKey: string, fingerprint: string, isServerKey: boolean): GeminiClientEntry {
+  const cacheKey = `${fingerprint}:${isServerKey ? 'server' : 'user'}`;
+  const now = Date.now();
+  let entry = clientCache.get(cacheKey);
+  if (entry && entry.expiresAt <= now) {
+    clientCache.delete(cacheKey);
+    entry = undefined;
   }
-  if (!cachedAi || cachedApiKey !== apiKey) {
-    cachedAi = createGenAIClient(apiKey, isServerKey);
-    cachedApiKey = apiKey;
+  if (!entry) {
+    entry = {
+      text: createGenAIClient(apiKey, isServerKey),
+      tts: createTtsGenAIClient(apiKey, isServerKey),
+      expiresAt: now + CLIENT_CACHE_TTL_MS,
+    };
   }
-  return { ai: cachedAi, isServerKey };
+  clientCache.delete(cacheKey);
+  clientCache.set(cacheKey, entry);
+  while (clientCache.size > CLIENT_CACHE_LIMIT) {
+    const oldest = clientCache.keys().next().value;
+    if (oldest === undefined) break;
+    clientCache.delete(oldest);
+  }
+  return entry;
 }
 
-function getTtsGeminiClient(apiKeyOverride?: string): { ai: GoogleGenAI; isServerKey: boolean } {
+function getGeminiClient(
+  apiKeyOverride?: string
+): { ai: GoogleGenAI; isServerKey: boolean; fingerprint: string } {
   const custom = sanitizeKey(apiKeyOverride);
-  const envKey = sanitizeKey(process.env.GEMINI_API_KEY);
+  const envKey = config.allowServerKey ? sanitizeKey(config.geminiApiKey) : '';
   const isServerKey = !custom;
   const apiKey = custom || envKey;
 
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error('GEMINI_API_KEY is not configured. Please enter your Gemini API key in Settings.');
+    throw new Error(
+      config.allowServerKey
+        ? 'GEMINI_API_KEY is not configured. Please enter your Gemini API key in Settings.'
+        : 'Server Gemini key use is disabled. Please enter your own Gemini API key in Settings.'
+    );
   }
-  return { ai: createTtsGenAIClient(apiKey, isServerKey), isServerKey };
+  const fingerprint = keyFingerprint(apiKey);
+  const entry = getClientEntry(apiKey, fingerprint, isServerKey);
+  return { ai: entry.text, isServerKey, fingerprint };
+}
+
+function getTtsGeminiClient(
+  apiKeyOverride?: string
+): { ai: GoogleGenAI; isServerKey: boolean; fingerprint: string } {
+  const custom = sanitizeKey(apiKeyOverride);
+  const envKey = config.allowServerKey ? sanitizeKey(config.geminiApiKey) : '';
+  const isServerKey = !custom;
+  const apiKey = custom || envKey;
+
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+    throw new Error(
+      config.allowServerKey
+        ? 'GEMINI_API_KEY is not configured. Please enter your Gemini API key in Settings.'
+        : 'Server Gemini key use is disabled. Please enter your own Gemini API key in Settings.'
+    );
+  }
+  const fingerprint = keyFingerprint(apiKey);
+  const entry = getClientEntry(apiKey, fingerprint, isServerKey);
+  return { ai: entry.tts, isServerKey, fingerprint };
 }
 
 function isAuthOrKeyError(raw: string): boolean {
@@ -115,7 +210,7 @@ function isModelNotFoundError(raw: string): boolean {
 }
 
 function sanitizeErrorMessage(raw: string, apiKey: string): string {
-  const cleaned = apiKey ? raw.split(apiKey).join('[REDACTED]') : raw;
+  const cleaned = redactSecrets(apiKey ? raw.split(apiKey).join('[REDACTED]') : raw);
   try {
     const parsed = JSON.parse(cleaned) as { error?: { message?: string } };
     if (parsed?.error?.message) return parsed.error.message;
@@ -140,44 +235,55 @@ function isUnsupportedTextModelName(name: string): boolean {
   );
 }
 
+function getCompatibleTextModelName(model: { name?: string; supportedActions?: string[] }): string | undefined {
+  const name = (model.name ?? '').replace(/^models\//i, '').trim();
+  if (!name || isUnsupportedTextModelName(name)) return undefined;
+  const actions = model.supportedActions ?? [];
+  return actions.length === 0 || actions.includes('generateContent') ? name : undefined;
+}
+
+function orderTextModels(
+  discovered: string[],
+  includeFallbacks: boolean,
+  preferences = PREFERRED_TEXT_MODELS
+): string[] {
+  const ordered: string[] = [];
+  for (const model of preferences) {
+    if (discovered.includes(model)) ordered.push(model);
+  }
+  for (const model of discovered) {
+    if (!ordered.includes(model)) ordered.push(model);
+  }
+  if (includeFallbacks) {
+    for (const model of PUBLIC_FALLBACK_MODELS) {
+      if (!ordered.includes(model)) ordered.push(model);
+    }
+  }
+  return ordered;
+}
+
+async function listAvailableVerificationModels(ai: GoogleGenAI): Promise<string[]> {
+  const pager = await ai.models.list({ config: { pageSize: 50 } });
+  const discovered = pager.page
+    .map(getCompatibleTextModelName)
+    .filter((name): name is string => Boolean(name));
+  return orderTextModels(discovered, false, PREFERRED_VERIFICATION_MODELS);
+}
+
 async function listCompatibleTextModels(ai: GoogleGenAI): Promise<string[]> {
   const discovered: string[] = [];
   try {
     const pager = await ai.models.list({ config: { pageSize: 50 } });
     for await (const m of pager) {
-      const rawName = (m.name ?? '').replace(/^models\//i, '').trim();
-      if (!rawName || isUnsupportedTextModelName(rawName)) continue;
-      const actions = m.supportedActions ?? [];
-      if (actions.length === 0 || actions.includes('generateContent')) {
-        discovered.push(rawName);
-      }
+      const name = getCompatibleTextModelName(m);
+      if (name) discovered.push(name);
       if (discovered.length >= 25) break;
     }
   } catch {
     // Some restricted keys disallow models.list; caller still probes PUBLIC_FALLBACK_MODELS
   }
 
-  // Prioritize fast, modern text models first
-  const priority = [
-    'gemini-4-hydrogen',
-    'gemini-3.1-flash-lite',
-    'gemini-2.5-flash',
-    'gemini-2.5-flash-lite',
-    'gemini-3-flash-preview',
-    'gemini-2.5-pro',
-  ];
-
-  const ordered: string[] = [];
-  for (const p of priority) {
-    if (discovered.includes(p)) ordered.push(p);
-  }
-  for (const d of discovered) {
-    if (!ordered.includes(d)) ordered.push(d);
-  }
-  for (const p of PUBLIC_FALLBACK_MODELS) {
-    if (!ordered.includes(p)) ordered.push(p);
-  }
-  return ordered;
+  return orderTextModels(discovered, true);
 }
 
 export async function verifyGeminiApiKey(
@@ -191,25 +297,26 @@ export async function verifyGeminiApiKey(
   error?: string;
 }> {
   const clean = sanitizeKey(apiKey);
-  const initialModel = resolveModel(modelOverride);
+  const requestedModel = resolveModel(modelOverride);
+  const initialModel =
+    requestedModel === DEFAULT_MODEL ? DEFAULT_VERIFICATION_MODEL : requestedModel;
   if (!clean) {
     return { valid: false, model: initialModel, error: 'Gemini API key is empty.' };
   }
 
-  const ai = createGenAIClient(clean, false);
+  const ai = new GoogleGenAI({
+    apiKey: clean,
+    httpOptions: {
+      timeout: GEMINI_VERIFICATION_TIMEOUT_MS,
+      retryOptions: { attempts: 1 },
+    },
+  });
 
-  // If the user hasn't picked a public model and kept the internal default 'gemini-4-hydrogen',
-  // still try it first, but ALWAYS probe compatible public models on failure.
+  let availableModels: string[];
   try {
-    await ai.models.generateContent({
-      model: initialModel,
-      contents: 'Reply with OK.',
-    });
-    return { valid: true, model: initialModel };
+    availableModels = await listAvailableVerificationModels(ai);
   } catch (err) {
     const raw = err instanceof Error ? err.message : String(err);
-
-    // Explicitly invalid key won't succeed on any model
     if (raw.includes('API_KEY_INVALID') || raw.includes('API key not valid') || raw.includes('leaked')) {
       return {
         valid: false,
@@ -218,47 +325,105 @@ export async function verifyGeminiApiKey(
       };
     }
 
-    // Probe listed / public models before concluding the key failed
-    const candidates = (await listCompatibleTextModels(ai)).filter((m) => m !== initialModel);
-    let lastProbeErr = raw;
-    for (const candidate of candidates.slice(0, 6)) {
-      try {
-        await ai.models.generateContent({
-          model: candidate,
-          contents: 'Reply with OK.',
-        });
+    try {
+      await ai.models.generateContent({
+        model: initialModel,
+        contents: 'Reply with OK.',
+      });
+      return { valid: true, model: initialModel };
+    } catch (generationError) {
+      const generationRaw =
+        generationError instanceof Error ? generationError.message : String(generationError);
+      if (
+        generationRaw.includes('API_KEY_INVALID') ||
+        generationRaw.includes('API key not valid') ||
+        generationRaw.includes('leaked')
+      ) {
         return {
-          valid: true,
-          model: candidate,
-          availableModels: candidates.slice(0, 8),
-          note: `Switched model from ${initialModel} to ${candidate} for compatibility with your API key.`,
+          valid: false,
+          model: initialModel,
+          error: `Gemini API key was rejected: ${sanitizeErrorMessage(generationRaw, clean)}`,
         };
-      } catch (probeErr) {
-        const probeRaw = probeErr instanceof Error ? probeErr.message : String(probeErr);
-        lastProbeErr = probeRaw;
-        if (probeRaw.includes('API_KEY_INVALID') || probeRaw.includes('API key not valid') || probeRaw.includes('leaked')) {
-          return {
-            valid: false,
-            model: initialModel,
-            error: `Gemini API key was rejected: ${sanitizeErrorMessage(probeRaw, clean)}`,
-          };
-        }
       }
-    }
-
-    if (lastProbeErr.includes('RESOURCE_EXHAUSTED') || lastProbeErr.includes('429')) {
+      if (generationRaw.includes('RESOURCE_EXHAUSTED') || generationRaw.includes('429')) {
+        return {
+          valid: false,
+          model: initialModel,
+          error: 'Gemini API key rate limit or quota exceeded (429). Please check billing/quota.',
+        };
+      }
+      if (isModelNotFoundError(generationRaw)) {
+        return {
+          valid: false,
+          model: initialModel,
+          error: `The key could not use model ${initialModel}. Select a model supported by your API key and try again.`,
+        };
+      }
       return {
         valid: false,
         model: initialModel,
-        error: 'Gemini API key rate limit or quota exceeded (429). Please check billing/quota.',
+        error: `Verification failed: ${sanitizeErrorMessage(generationRaw, clean)}`,
       };
     }
+  }
 
+  if (availableModels.length === 0) {
     return {
       valid: false,
       model: initialModel,
-      error: `Verification failed: ${sanitizeErrorMessage(lastProbeErr, clean)}`,
+      error: 'This API key does not list any text-generation models. Check that Gemini API access is enabled for this key.',
     };
+  }
+
+  const candidateModels = [
+    ...(availableModels.includes(initialModel) ? [initialModel] : []),
+    ...availableModels.filter((model) => model !== initialModel),
+  ].slice(0, MAX_GEMINI_VERIFICATION_MODELS);
+  let lastUnsupportedModel: string | undefined;
+  for (const model of candidateModels) {
+    try {
+      await ai.models.generateContent({
+        model,
+        contents: 'Reply with OK.',
+      });
+      return {
+        valid: true,
+        model,
+        availableModels: availableModels.slice(0, 8),
+        note: model === initialModel ? undefined : `Using ${model}, which is available to this API key.`,
+      };
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      if (raw.includes('API_KEY_INVALID') || raw.includes('API key not valid') || raw.includes('leaked')) {
+        return {
+          valid: false,
+          model,
+          error: `Gemini API key was rejected: ${sanitizeErrorMessage(raw, clean)}`,
+        };
+      }
+      if (raw.includes('RESOURCE_EXHAUSTED') || raw.includes('429')) {
+        return {
+          valid: false,
+          model,
+          error: 'Gemini API key rate limit or quota exceeded (429). Please check billing/quota.',
+        };
+      }
+      if (!isModelNotFoundError(raw)) {
+        return {
+          valid: false,
+          model,
+          error: `Verification failed: ${sanitizeErrorMessage(raw, clean)}`,
+        };
+      }
+      lastUnsupportedModel = model;
+    }
+  }
+
+  return {
+    valid: false,
+    model: lastUnsupportedModel ?? initialModel,
+    availableModels: availableModels.slice(0, 8),
+    error: `The API key lists models but Gemini could not generate content with the checked models: ${candidateModels.join(', ')}.`,
   }
 }
 
@@ -311,7 +476,7 @@ export async function generateGroundedExplanation(
   history: { role: 'user' | 'assistant'; content: string }[],
   options?: { apiKeyOverride?: string; modelOverride?: string }
 ): Promise<GeminiAnswerResult> {
-  const { ai, isServerKey } = getGeminiClient(options?.apiKeyOverride);
+  const { ai, isServerKey, fingerprint } = getGeminiClient(options?.apiKeyOverride);
   let activeModel = resolveModel(options?.modelOverride);
   const retrieved = retrieveRepositoryEvidence(repo, question, context);
 
@@ -327,8 +492,7 @@ export async function generateGroundedExplanation(
   ].join('\n');
 
   const recentHistory = history
-    .slice(-4)
-    .map((m) => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.content.slice(0, 600)}`)
+    .map((m) => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.content}`)
     .join('\n\n');
 
   const prompt = [
@@ -393,7 +557,7 @@ export async function generateGroundedExplanation(
   let response;
   try {
     response = await callStructured(activeModel);
-    if (isServerKey) serverKeyRejected = false;
+    markKeyAccepted(fingerprint);
   } catch (err) {
     const raw = err instanceof Error ? err.message : String(err);
     const explicitlyInvalidKey =
@@ -401,8 +565,8 @@ export async function generateGroundedExplanation(
       raw.includes('API key not valid') ||
       raw.includes('leaked');
 
-    if (explicitlyInvalidKey || (isServerKey && isAuthOrKeyError(raw))) {
-      if (isServerKey) serverKeyRejected = true;
+    if (explicitlyInvalidKey || isAuthOrKeyError(raw)) {
+      markKeyRejected(fingerprint);
       throw new Error(
         isServerKey
           ? 'GEMINI_API_KEY is missing, invalid, or restricted. Please enter your own Gemini API key in Settings.'
@@ -435,6 +599,7 @@ export async function generateGroundedExplanation(
             retryRaw.includes('API key not valid') ||
             retryRaw.includes('leaked')
           ) {
+            markKeyRejected(fingerprint);
             throw new Error(
               `Your Gemini API key was rejected: ${sanitizeErrorMessage(retryRaw, sanitizeKey(options?.apiKeyOverride))}`
             );
@@ -446,6 +611,7 @@ export async function generateGroundedExplanation(
           `Gemini request failed (${sanitizeErrorMessage(lastRetryRaw, sanitizeKey(options?.apiKeyOverride))}). Check your Gemini API key or select a different model in Settings.`
         );
       }
+      markKeyAccepted(fingerprint);
     } else if (raw.includes('INVALID_ARGUMENT') || raw.toLowerCase().includes('schema') || raw.toLowerCase().includes('json')) {
       response = await callPlainMarkdown(activeModel);
     } else if (raw.includes('RESOURCE_EXHAUSTED') || raw.includes('429')) {
@@ -606,7 +772,7 @@ export async function generateSpeechAudio(
   text: string,
   options?: { apiKeyOverride?: string }
 ): Promise<{ audioBase64: string; mimeType: string; spokenText: string; modelUsed: string }> {
-  const { ai, isServerKey } = getTtsGeminiClient(options?.apiKeyOverride);
+  const { ai, isServerKey, fingerprint } = getTtsGeminiClient(options?.apiKeyOverride);
   const spokenText = prepareSpokenText(text, 600);
 
   const callTtsModel = async (modelName: string) => {
@@ -641,7 +807,7 @@ export async function generateSpeechAudio(
 
   try {
     response = await callTtsModel(DEFAULT_TTS_MODEL);
-    if (isServerKey) serverKeyRejected = false;
+    markKeyAccepted(fingerprint);
   } catch (err) {
     const raw = err instanceof Error ? err.message : String(err);
     const explicitlyInvalidKey =
@@ -649,8 +815,8 @@ export async function generateSpeechAudio(
       raw.includes('API key not valid') ||
       raw.includes('leaked');
 
-    if (explicitlyInvalidKey || (isServerKey && isAuthOrKeyError(raw))) {
-      if (isServerKey) serverKeyRejected = true;
+    if (explicitlyInvalidKey || isAuthOrKeyError(raw)) {
+      markKeyRejected(fingerprint);
       throw new Error(
         isServerKey
           ? 'GEMINI_API_KEY is missing, invalid, or restricted for audio synthesis.'
@@ -675,6 +841,7 @@ export async function generateSpeechAudio(
       if (!recovered) {
         throw new Error(`TTS unavailable: ${sanitizeErrorMessage(lastErr, sanitizeKey(options?.apiKeyOverride))}`);
       }
+      markKeyAccepted(fingerprint);
     } else if (raw.includes('RESOURCE_EXHAUSTED') || raw.includes('429')) {
       throw new Error('Gemini TTS rate limit reached (429).');
     } else {

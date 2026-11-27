@@ -74,6 +74,22 @@ export function TopNav() {
 
         {/* Zone 3: Single primary action */}
         <div className="flex items-center shrink-0">
+          {user ? (
+            <button
+              type="button"
+              onClick={() => void logout()}
+              className="mr-3 text-xs font-medium text-[#9CA3AF] hover:text-[#F3F4F6] transition-colors whitespace-nowrap cursor-pointer md:hidden"
+            >
+              Sign out
+            </button>
+          ) : (
+            <Link
+              to="/login"
+              className="mr-3 text-xs font-medium text-[#9CA3AF] hover:text-[#F3F4F6] transition-colors whitespace-nowrap md:hidden"
+            >
+              Sign in
+            </Link>
+          )}
           <Link
             to="/workspace/dietrichgebert__ponytail"
             className="rounded-md bg-sky-500 px-3.5 py-1.5 text-xs font-semibold text-[#0B0D10] hover:bg-sky-400 transition-colors whitespace-nowrap shrink-0"

@@ -15,16 +15,18 @@ import {
   Square,
   Loader2,
   PanelLeftClose,
-  Mic,
-  MicOff,
+  Plus,
+  Pencil,
+  FileJson,
+  FileText,
 } from 'lucide-react';
 import type {
   ChatCitation,
   ChatContext,
   ChatMessage,
+  ChatRecord,
   CodeAttachment,
 } from '../types/codebase';
-import type { ApiCredentialHeaders } from '../utils/api';
 import {
   clearAudioCache,
   stopAllSpeech,
@@ -39,13 +41,25 @@ interface ChatPanelProps {
   messages: ChatMessage[];
   loading: boolean;
   context: ChatContext;
-  credentials?: ApiCredentialHeaders;
   hasCustomGeminiKey?: boolean;
+  keyStatusError?: string;
   onQuickApplyGeminiKey?: (apiKey: string, retryQuestion?: string) => Promise<string | null>;
   onClearAttachedCode: () => void;
   onAttachCode: (att: CodeAttachment) => void;
   onSendMessage: (question: string) => void;
   onClearChat: () => void;
+  chats: ChatRecord[];
+  activeChatId: string | null;
+  loadingChats: boolean;
+  chatError: string | null;
+  hasMoreMessages: boolean;
+  loadingOlderMessages: boolean;
+  onCreateChat: () => void;
+  onSelectChat: (chatId: string) => void;
+  onRenameChat: (chatId: string, title: string) => void;
+  onDeleteChat: (chatId: string) => void;
+  onExportChat: (chatId: string, format: 'json' | 'markdown') => void;
+  onLoadOlderMessages: () => void;
   onOpenCitation: (filePath: string, startLine: number, endLine: number) => void;
   onTraceCode?: (codeText: string, citations?: ChatCitation[]) => Promise<boolean> | boolean;
 }
@@ -59,39 +73,6 @@ const STARTER_QUESTIONS = [
 
 const BARE_FILE_REF_RE =
   /((?:[a-zA-Z0-9_.-]+\/)*[a-zA-Z0-9_-]+\.(?:tsx|ts|jsx|js|mjs|cjs|py|json|yml|yaml|md|css|html|sql|sh|ps1|txt|toml|lock)(?::L?\d+(?:[-–]L?\d+)?)?)/g;
-
-interface SpeechRecognitionResultLike {
-  readonly isFinal: boolean;
-  readonly length: number;
-  readonly [index: number]: { readonly transcript: string };
-}
-
-interface SpeechRecognitionEventLike {
-  readonly resultIndex: number;
-  readonly results: { readonly length: number; readonly [index: number]: SpeechRecognitionResultLike };
-}
-
-interface SpeechRecognitionErrorEventLike {
-  readonly error: string;
-}
-
-interface SpeechRecognitionLike {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-}
-
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
-type SpeechRecognitionWindow = Window & {
-  SpeechRecognition?: SpeechRecognitionConstructor;
-  webkitSpeechRecognition?: SpeechRecognitionConstructor;
-};
 
 function renderCodeChip(
   codeText: string,
@@ -262,13 +243,25 @@ export function ChatPanel({
   messages,
   loading,
   context,
-  credentials,
   hasCustomGeminiKey,
+  keyStatusError,
   onQuickApplyGeminiKey,
   onClearAttachedCode,
   onAttachCode,
   onSendMessage,
   onClearChat,
+  chats,
+  activeChatId,
+  loadingChats,
+  chatError,
+  hasMoreMessages,
+  loadingOlderMessages,
+  onCreateChat,
+  onSelectChat,
+  onRenameChat,
+  onDeleteChat,
+  onExportChat,
+  onLoadOlderMessages,
   onOpenCitation,
   onTraceCode,
 }: ChatPanelProps) {
@@ -283,12 +276,10 @@ export function ChatPanel({
   const [speechState, setSpeechState] = useState<'idle' | 'loading' | 'playing'>('idle');
   const [speechEngineLabel, setSpeechEngineLabel] = useState<string>('');
   const [traceNotice, setTraceNotice] = useState<string | null>(null);
-  const [isListening, setIsListening] = useState(false);
-  const [interimTranscript, setInterimTranscript] = useState('');
-  const [voiceInputError, setVoiceInputError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+  const previousScrollHeightRef = useRef<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const dragDepthRef = useRef(0);
   const traceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -332,7 +323,6 @@ export function ChatPanel({
       messageId: msg.id,
       markdown: msg.content,
       mode: modeOverride ?? voiceMode,
-      credentials,
       audioRef,
       signal: controller.signal,
       onLoading: () => {
@@ -371,6 +361,13 @@ export function ChatPanel({
   };
 
   useEffect(() => {
+    const container = messagesContainerRef.current;
+    const previousHeight = previousScrollHeightRef.current;
+    if (container && previousHeight !== null) {
+      container.scrollTop += container.scrollHeight - previousHeight;
+      previousScrollHeightRef.current = null;
+      return;
+    }
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
 
@@ -392,13 +389,6 @@ export function ChatPanel({
     return () => {
       window.removeEventListener('dragend', resetDrag);
       if (traceTimerRef.current) clearTimeout(traceTimerRef.current);
-      if (recognitionRef.current) {
-        recognitionRef.current.onresult = null;
-        recognitionRef.current.onerror = null;
-        recognitionRef.current.onend = null;
-        recognitionRef.current.abort();
-        recognitionRef.current = null;
-      }
       abortControllerRef.current?.abort();
       playbackHandleRef.current?.stop();
       stopAllSpeech(audioRef.current);
@@ -406,82 +396,15 @@ export function ChatPanel({
     };
   }, []);
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const submitInput = () => {
     if (!input.trim() || loading) return;
-    if (recognitionRef.current) {
-      recognitionRef.current.onresult = null;
-      recognitionRef.current.stop();
-      recognitionRef.current = null;
-      setIsListening(false);
-      setInterimTranscript('');
-    }
     onSendMessage(input.trim());
     setInput('');
   };
 
-  const startVoiceInput = () => {
-    const speechWindow = window as SpeechRecognitionWindow;
-    const Recognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
-    if (!Recognition) {
-      setVoiceInputError('Voice input is not supported by this browser.');
-      return;
-    }
-
-    setVoiceInputError(null);
-    setInterimTranscript('');
-    try {
-      const recognition = new Recognition();
-      recognition.lang = navigator.language || 'en-US';
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.onresult = (event) => {
-        let finalText = '';
-        let interimText = '';
-        for (let i = event.resultIndex; i < event.results.length; i += 1) {
-          const result = event.results[i];
-          const transcript = result[0]?.transcript ?? '';
-          if (result.isFinal) finalText += transcript;
-          else interimText += transcript;
-        }
-        setInterimTranscript(interimText.trim());
-        if (finalText.trim()) {
-          setInput((current) => `${current.trimEnd()}${current.trim() ? ' ' : ''}${finalText.trim()}`);
-        }
-      };
-      recognition.onerror = (event) => {
-        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-          setVoiceInputError('Microphone access was denied. Allow microphone access in your browser settings.');
-        } else if (event.error === 'no-speech') {
-          setVoiceInputError('No speech was detected. Try speaking again.');
-        } else if (event.error !== 'aborted') {
-          setVoiceInputError('Voice input failed. Check your microphone and try again.');
-        }
-      };
-      recognition.onend = () => {
-        if (recognitionRef.current === recognition) recognitionRef.current = null;
-        setIsListening(false);
-        setInterimTranscript('');
-      };
-      recognitionRef.current = recognition;
-      recognition.start();
-      setIsListening(true);
-    } catch (error) {
-      recognitionRef.current = null;
-      setIsListening(false);
-      setVoiceInputError(
-        error instanceof Error ? `Unable to start voice input: ${error.message}` : 'Unable to start voice input.'
-      );
-    }
-  };
-
-  const toggleVoiceInput = () => {
-    setVoiceInputError(null);
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-      return;
-    }
-    startVoiceInput();
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    submitInput();
   };
 
   const hasSnippetPayload = (dt: DataTransfer | null): boolean =>
@@ -551,6 +474,9 @@ export function ChatPanel({
             Grounded in {repositoryName}
             {hasCustomGeminiKey ? ' · Custom Gemini key' : ''}
           </p>
+          {keyStatusError && (
+            <p className="text-[10px] text-amber-400">{keyStatusError}</p>
+          )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
           <button
@@ -609,20 +535,93 @@ export function ChatPanel({
           >
             <KeyRound className="h-3.5 w-3.5" />
           </Link>
-          {messages.length > 0 && (
+          {chats.length > 0 && (
             <button
               type="button"
               onClick={() => {
                 stopSpeaking();
-                onClearChat();
+                if (window.confirm('Delete all chats for this repository?')) onClearChat();
               }}
-              title="Clear conversation"
+              title="Delete all chats for this repository"
               className="rounded p-1 text-[#6B7280] hover:bg-[#1A1F28] hover:text-[#E6E9EF] cursor-pointer"
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>
           )}
         </div>
+      </div>
+
+      <div className="flex items-center gap-1 border-b border-[#232832] px-2 py-1.5">
+        <select
+          aria-label="Select chat"
+          value={activeChatId ?? ''}
+          disabled={loadingChats || chats.length === 0}
+          onChange={(event) => onSelectChat(event.target.value)}
+          className="min-w-0 flex-1 rounded border border-[#232832] bg-[#0B0D10] px-2 py-1 text-[11px] text-[#D1D5DB] disabled:opacity-60"
+        >
+          <option value="" disabled>
+            {loadingChats ? 'Loading chats...' : chats.length ? 'Select chat' : 'No saved chats'}
+          </option>
+          {chats.map((chat) => (
+            <option key={chat.id} value={chat.id}>{chat.title}</option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={onCreateChat}
+          title="Start a new chat"
+          aria-label="Start a new chat"
+          className="rounded p-1 text-[#6B7280] hover:bg-[#1A1F28] hover:text-sky-300"
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          disabled={!activeChatId}
+          onClick={() => {
+            const chat = chats.find((item) => item.id === activeChatId);
+            if (!activeChatId || !chat) return;
+            const title = window.prompt('Rename chat', chat.title)?.trim();
+            if (title) onRenameChat(activeChatId, title);
+          }}
+          title="Rename chat"
+          aria-label="Rename chat"
+          className="rounded p-1 text-[#6B7280] hover:bg-[#1A1F28] hover:text-sky-300 disabled:opacity-40"
+        >
+          <Pencil className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          disabled={!activeChatId}
+          onClick={() => activeChatId && onExportChat(activeChatId, 'json')}
+          title="Export chat as JSON"
+          aria-label="Export chat as JSON"
+          className="rounded p-1 text-[#6B7280] hover:bg-[#1A1F28] hover:text-sky-300 disabled:opacity-40"
+        >
+          <FileJson className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          disabled={!activeChatId}
+          onClick={() => activeChatId && onExportChat(activeChatId, 'markdown')}
+          title="Export chat as Markdown"
+          aria-label="Export chat as Markdown"
+          className="rounded p-1 text-[#6B7280] hover:bg-[#1A1F28] hover:text-sky-300 disabled:opacity-40"
+        >
+          <FileText className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          disabled={!activeChatId}
+          onClick={() => {
+            if (activeChatId && window.confirm('Delete this chat?')) onDeleteChat(activeChatId);
+          }}
+          title="Delete this chat"
+          aria-label="Delete this chat"
+          className="rounded p-1 text-[#6B7280] hover:bg-[#1A1F28] hover:text-rose-300 disabled:opacity-40"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
       </div>
 
       {/* Active Workspace Focus Strip */}
@@ -636,7 +635,27 @@ export function ChatPanel({
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-3.5 py-3 space-y-4">
+      <div ref={messagesContainerRef} className="flex-1 overflow-y-auto px-3.5 py-3 space-y-4">
+        {chatError && (
+          <div role="alert" className="rounded border border-rose-500/30 bg-rose-500/10 p-2 text-[11px] text-rose-300">
+            {chatError}
+          </div>
+        )}
+        {hasMoreMessages && (
+          <button
+            type="button"
+            disabled={loadingOlderMessages}
+            onClick={() => {
+              if (messagesContainerRef.current) {
+                previousScrollHeightRef.current = messagesContainerRef.current.scrollHeight;
+              }
+              onLoadOlderMessages();
+            }}
+            className="w-full rounded border border-[#232832] px-2 py-1.5 text-[11px] text-[#9CA3AF] hover:text-[#E6E9EF] disabled:opacity-50"
+          >
+            {loadingOlderMessages ? 'Loading older messages...' : 'Load older messages'}
+          </button>
+        )}
         {messages.length === 0 ? (
           <div className="space-y-4 py-2">
             <div className="rounded-lg border border-[#232832] bg-[#0D1015] p-3.5 text-xs leading-relaxed text-[#9CA3AF]">
@@ -872,30 +891,6 @@ export function ChatPanel({
         </div>
       )}
 
-      {/* Dragged Code Attachment Preview */}
-      {context.attachedCode && (
-        <div className="mx-3 mb-2 rounded-md border border-sky-500/40 bg-[#0D141F] p-2">
-          <div className="flex items-center justify-between gap-2 mb-1">
-            <span className="truncate font-mono text-[10px] text-sky-300">
-              Attached:{' '}
-              {context.attachedCode.symbol_name ? `${context.attachedCode.symbol_name} · ` : ''}
-              {context.attachedCode.file_path}:L{context.attachedCode.start_line}-{context.attachedCode.end_line}
-            </span>
-            <button
-              type="button"
-              onClick={onClearAttachedCode}
-              className="text-[#9CA3AF] hover:text-[#F3F4F6] cursor-pointer"
-              title="Remove attachment"
-            >
-              <X className="h-3 w-3" />
-            </button>
-          </div>
-          <pre className="max-h-20 overflow-hidden font-mono text-[10px] text-[#9CA3AF]">
-            {context.attachedCode.code}
-          </pre>
-        </div>
-      )}
-
       {/* Input Form */}
       <form
         onSubmit={handleSubmit}
@@ -903,7 +898,29 @@ export function ChatPanel({
           isDraggingOver ? 'bg-sky-500/10' : 'bg-[#0D1015]'
         }`}
       >
-        <div className="relative">
+        <div className="relative rounded-md border border-[#232832] bg-[#0B0D10] focus-within:border-sky-500/60">
+          {context.attachedCode && (
+            <div className="border-b border-sky-500/30 bg-[#0D141F] p-2">
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <span className="truncate font-mono text-[10px] text-sky-300">
+                  Attached:{' '}
+                  {context.attachedCode.symbol_name ? `${context.attachedCode.symbol_name} · ` : ''}
+                  {context.attachedCode.file_path}:L{context.attachedCode.start_line}-{context.attachedCode.end_line}
+                </span>
+                <button
+                  type="button"
+                  onClick={onClearAttachedCode}
+                  className="shrink-0 text-[#9CA3AF] hover:text-[#F3F4F6] cursor-pointer"
+                  title="Remove attachment"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+              <pre className="max-h-24 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] text-[#9CA3AF]">
+                {context.attachedCode.code}
+              </pre>
+            </div>
+          )}
           <textarea
             ref={textareaRef}
             rows={2}
@@ -919,10 +936,7 @@ export function ChatPanel({
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                if (input.trim() && !loading) {
-                  onSendMessage(input.trim());
-                  setInput('');
-                }
+                submitInput();
               }
             }}
             placeholder={
@@ -930,22 +944,8 @@ export function ChatPanel({
                 ? 'Drop code block here to attach...'
                 : 'Ask about this repo, file, function, or drag code here...'
             }
-            className="w-full resize-none rounded-md border border-[#232832] bg-[#0B0D10] py-2 pl-3 pr-20 text-xs text-[#E6E9EF] placeholder-[#6B7280] focus:border-sky-500/60 focus:outline-none"
+            className="w-full resize-none bg-transparent py-2 pl-3 pr-10 text-xs text-[#E6E9EF] placeholder-[#6B7280] focus:outline-none"
           />
-          <button
-            type="button"
-            onClick={toggleVoiceInput}
-            aria-label={isListening ? 'Stop voice input' : 'Start voice input'}
-            aria-pressed={isListening}
-            title={isListening ? 'Stop voice input' : 'Start voice input'}
-            className={`absolute bottom-2 right-10 rounded p-1.5 transition-colors cursor-pointer ${
-              isListening
-                ? 'bg-rose-500/20 text-rose-300 hover:bg-rose-500/30'
-                : 'text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-[#E6E9EF]'
-            }`}
-          >
-            {isListening ? <MicOff className="h-3.5 w-3.5" /> : <Mic className="h-3.5 w-3.5" />}
-          </button>
           <button
             type="submit"
             disabled={loading || !input.trim()}
@@ -955,16 +955,6 @@ export function ChatPanel({
             <Send className="h-3.5 w-3.5" />
           </button>
         </div>
-        {isListening && (
-          <p role="status" className="mt-1.5 text-[11px] text-sky-300">
-            Listening{interimTranscript ? `: ${interimTranscript}` : '...'}
-          </p>
-        )}
-        {voiceInputError && (
-          <p role="alert" className="mt-1.5 text-[11px] text-rose-300">
-            {voiceInputError}
-          </p>
-        )}
       </form>
     </div>
   );

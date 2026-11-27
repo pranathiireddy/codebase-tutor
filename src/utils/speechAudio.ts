@@ -1,4 +1,4 @@
-import { buildApiHeaders, safeJson, type ApiCredentialHeaders } from './api';
+import { apiFetch, safeJson } from './api';
 
 export type VoiceEngineMode = 'lite' | 'browser';
 
@@ -134,7 +134,6 @@ export async function synthesizeAndPlayAnswer(options: {
   messageId: string;
   markdown: string;
   mode: VoiceEngineMode;
-  credentials?: ApiCredentialHeaders;
   audioRef: { current: HTMLAudioElement | null };
   signal?: AbortSignal;
   onLoading: () => void;
@@ -142,7 +141,7 @@ export async function synthesizeAndPlayAnswer(options: {
   onEnded: () => void;
   onError: (msg: string) => void;
 }): Promise<PlaybackHandle> {
-  const { messageId, markdown, mode, credentials, audioRef, signal, onLoading, onPlaying, onEnded, onError } = options;
+  const { messageId, markdown, mode, audioRef, signal, onLoading, onPlaying, onEnded, onError } = options;
 
   stopAllSpeech(audioRef.current);
 
@@ -199,9 +198,9 @@ export async function synthesizeAndPlayAnswer(options: {
   onLoading();
 
   try {
-    const res = await fetch('/api/tts', {
+    const res = await apiFetch('/api/tts', {
       method: 'POST',
-      headers: buildApiHeaders(credentials, { 'Content-Type': 'application/json' }),
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: spokenDigest }),
       signal,
     });
