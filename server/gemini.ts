@@ -481,7 +481,7 @@ export async function generateGroundedExplanation(
   const retrieved = retrieveRepositoryEvidence(repo, question, context);
 
   const systemInstruction = [
-    'You are Codebase Tutor, a patient, accurate software engineering mentor helping students and developers understand real repositories.',
+    'You are Plupus, a patient, accurate software engineering mentor helping students and developers understand real repositories.',
     'CRITICAL GROUNDING RULES:',
     '1. Base every claim ONLY on the verified repository metadata, knowledge graph facts, and source snippets provided inside <untrusted_repo_evidence>.',
     '2. NEVER invent files, functions, classes, API routes, databases, or execution paths that are not shown in the evidence.',
@@ -690,7 +690,7 @@ export function prepareSpokenText(markdown: string, maxChars = 600): string {
     .trim();
 
   if (!cleaned) {
-    return 'Here is the explanation from Codebase Tutor.';
+    return 'Here is the explanation from Plupus.';
   }
 
   if (cleaned.length <= maxChars) {

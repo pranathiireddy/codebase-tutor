@@ -1529,7 +1529,7 @@ app.get('/api/chats/:chatId/export', requireAuth, (req: Request, res: Response) 
           `Repository: ${chat.repositoryId}`,
           '',
           ...serializedMessages.flatMap((message) => [
-            `## ${message.role === 'user' ? 'You' : 'Codebase Tutor'}`,
+            `## ${message.role === 'user' ? 'You' : 'Plupus'}`,
             '',
             message.contextLabel ? `Context: ${message.contextLabel}` : '',
             message.content,

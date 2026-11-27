@@ -1,6 +1,6 @@
-# Codebase Tutor
+# Plupus
 
-Codebase Tutor analyzes public GitHub repositories into source indexes, a knowledge graph, and diagrams. Authenticated users can import repositories and ask grounded questions in tutor chat.
+Plupus analyzes public GitHub repositories into source indexes, a knowledge graph, and diagrams. Authenticated users can import repositories and ask grounded questions in tutor chat.
 
 ## Requirements
 

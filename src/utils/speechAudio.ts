@@ -21,7 +21,7 @@ export function prepareSpokenDigest(markdown: string, maxChars = 600): string {
     .trim();
 
   if (!cleaned) {
-    return 'Here is the explanation from Codebase Tutor.';
+    return 'Here is the explanation from Plupus.';
   }
   if (cleaned.length <= maxChars) {
     return cleaned;

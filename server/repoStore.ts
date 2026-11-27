@@ -341,7 +341,7 @@ export function initializeFeaturedDemo(): void {
       isFeaturedDemo: true,
       stage: 'queued',
       progress: 0,
-      stageMessage: 'Ready to analyze via Codebase Tutor pipeline...',
+      stageMessage: 'Ready to analyze via Plupus pipeline...',
     });
   }
   // Pre-warm Ponytail through the exact same generic pipeline
