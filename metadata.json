@@ -1,5 +1,5 @@
 {
-  "name": "Codebase Tutor",
+  "name": "Plupus",
   "description": "Understand the entire codebase. Interactive architecture maps, connected source code, execution flows, and evidence-grounded explanations.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

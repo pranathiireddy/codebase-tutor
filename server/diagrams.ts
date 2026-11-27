@@ -579,7 +579,7 @@ function buildCicdDiagram(repositoryId: string, analysis: AnalysisResult): Diagr
       available: false,
       availabilityNote: 'No CI/CD workflow definitions (.github/workflows/*.yml, .gitlab-ci.yml, or Jenkinsfile) were found in this repository.',
       summary: 'No CI/CD pipeline configuration detected.',
-      coverageNotes: ['Codebase Tutor does not invent pipeline stages when no workflow configuration exists.'],
+      coverageNotes: ['Plupus does not invent pipeline stages when no workflow configuration exists.'],
       nodes: [],
       edges: [],
     };

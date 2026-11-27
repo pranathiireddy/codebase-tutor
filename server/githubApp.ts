@@ -132,7 +132,7 @@ export async function storeGitHubAppInstallation(
     !accountLogin ||
     installation.permissions?.contents !== 'read'
   ) {
-    throw new GitHubAppError('Install the Codebase Tutor GitHub App with read-only Contents permission.');
+    throw new GitHubAppError('Install the Plupus GitHub App with read-only Contents permission.');
   }
   const accessToken = await createInstallationToken(installationId);
   const now = Date.now();

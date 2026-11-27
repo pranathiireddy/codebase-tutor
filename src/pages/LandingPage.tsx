@@ -1,11 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowRight,
-  ExternalLink,
-  GitBranch,
-  Layers,
-  Code2,
-  MessageSquare,
   RefreshCw,
   CheckCircle2,
   AlertCircle,
@@ -132,15 +127,57 @@ export function LandingPage() {
     <div className="min-h-screen bg-[#0B0D10] text-[#E6E9EF]">
       <TopNav />
 
+      {!user ? (
+        <main className="guest-main flex min-h-[calc(100vh-3.5rem)] items-center justify-center px-6 py-6">
+          <section className="guest-landing-card w-full max-w-[475px] rounded-[2rem] border border-[#C4DCE8] px-7 py-5 text-center sm:px-9">
+            <div className="flex flex-col items-center">
+              <img src="/brand/plupus-logo.png" alt="" className="brand-octopus h-7 w-9" />
+              <h1 className="brand-wordmark text-[1.75rem] leading-none">PLUPUS</h1>
+              <p className="mt-1 text-[13px] text-[#526D7C]">Interactive Codebase Understanding</p>
+            </div>
+
+            <Link to="/login" className="guest-sign-in mt-6 inline-flex rounded-full border border-[#B8D3E0] px-4 py-1 text-[13px] text-[#172D3A]">
+              Sign in
+            </Link>
+
+            <div className="guest-demo-card mt-4 rounded-[1.75rem] border border-white/60 px-5 py-4 text-left sm:px-6">
+              <h2 className="text-[13px] font-semibold text-[#172D3A]">Try Plupus on a real repository</h2>
+              <p className="mt-1.5 truncate text-[11px] font-semibold text-[#263F4D]">
+                ponytail · github.com/DietrichGebert/ponytail ·{' '}
+                {ponytail?.stage === 'ready'
+                  ? `Ready (commit ${ponytail.commitSha.slice(0, 7)})`
+                  : ponytail?.stage === 'error'
+                    ? 'Temporarily unavailable'
+                    : 'Preparing demo'}
+              </p>
+              <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-[#526D7C]">
+                {ponytail?.overview?.summary ||
+                  ponytail?.description ||
+                  'Explore a real open-source codebase with interactive diagrams, connected source code, and guided explanations.'}
+              </p>
+              {submitError && <p className="mt-2 text-xs text-rose-700">{submitError}</p>}
+              <div className="mt-2 flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => ponytail ? handleExploreDemo(ponytail) : navigate('/workspace/dietrichgebert__ponytail')}
+                  className="guest-explore-button rounded-full border border-[#B8D3E0] px-3 py-0.5 text-[10px] text-[#172D3A]"
+                >
+                  Explore Repository
+                </button>
+              </div>
+            </div>
+          </section>
+        </main>
+      ) : (
       <main className="mx-auto max-w-[1200px] px-6 py-16 space-y-20">
         {/* Hero + Importer */}
         <section className="grid grid-cols-1 gap-12 lg:grid-cols-12 lg:items-start">
           <div className="lg:col-span-7 space-y-6">
             <p className="text-xs font-medium text-sky-400">
-              Codebase Tutor · Interactive Codebase Understanding
+              PLUPUS · Interactive Codebase Understanding
             </p>
             <h1
-              className="text-4xl font-bold tracking-tight text-[#F9FAFB] sm:text-5xl leading-[1.12]"
+              className="brand-wordmark text-4xl font-normal tracking-tight sm:text-5xl leading-[1.12]"
               style={{ textWrap: 'balance' }}
             >
               Understand any codebase. Not just read it.
@@ -292,167 +329,40 @@ export function LandingPage() {
           </div>
         </section>
 
-        {/* Featured Demo Repository: Ponytail */}
-        <section className="space-y-4">
-          <div className="flex items-baseline justify-between gap-4 border-b border-[#232832] pb-3">
-            <div>
-              <h2 className="text-lg font-semibold text-[#F3F4F6]">
-                Try Codebase Tutor on a real repository
-              </h2>
-              <p className="mt-0.5 text-xs text-[#9CA3AF]">
-                Featured repository analyzed through the exact same generic ingestion and knowledge graph pipeline.
-              </p>
-            </div>
-          </div>
-
-          <div className="rounded-xl border border-[#232832] bg-[#111419] p-6">
-            <div className="flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
-              <div className="space-y-2.5 max-w-3xl">
-                <div className="flex flex-wrap items-center gap-3">
-                  <h3 className="font-mono text-base font-semibold text-[#F9FAFB]">
-                    {ponytail?.name ?? 'ponytail'}
-                  </h3>
-                  <span className="text-xs text-[#6B7280]">·</span>
-                  <a
-                    href="https://github.com/DietrichGebert/ponytail"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1 font-mono text-xs text-sky-400 hover:text-sky-300"
-                  >
-                    <span>github.com/DietrichGebert/ponytail</span>
-                    <ExternalLink className="h-3 w-3" />
-                  </a>
-                  <span className="text-xs text-[#6B7280]">·</span>
-                  <span className="text-xs text-[#9CA3AF]">
-                    {ponytail?.stage === 'ready'
-                      ? `Ready (commit ${ponytail.commitSha.slice(0, 7)})`
-                      : ponytail?.stage === 'error'
-                        ? 'Analysis failed'
-                        : ponytail
-                          ? `${ponytail.stageMessage}`
-                          : 'Initializing pipeline...'}
-                  </span>
-                </div>
-
-                <p className="text-sm leading-relaxed text-[#D1D5DB]">
-                  {ponytail?.overview?.summary ||
-                    ponytail?.description ||
-                    'Retrieving repository description and README summary from GitHub...'}
-                </p>
-
-                {ponytail?.overview?.languages && ponytail.overview.languages.length > 0 && (
-                  <div className="flex flex-wrap items-center gap-2 text-xs text-[#9CA3AF]">
-                    <span className="text-[#6B7280]">Detected languages:</span>
-                    {ponytail.overview.languages.slice(0, 5).map((lang, i) => (
-                      <span key={lang.name} className="font-mono tabular-nums">
-                        {i > 0 && <span className="mr-2 text-[#4B5563]">·</span>}
-                        {lang.name} ({lang.percentage}%)
-                      </span>
-                    ))}
-                  </div>
-                )}
-
-                {ponytail?.stage === 'error' && ponytail.error && (
-                  <p className="text-xs text-rose-400">{ponytail.error}</p>
-                )}
-              </div>
-
-              <div className="flex items-center gap-3 shrink-0">
-                {ponytail?.stage === 'error' ? (
-                  <button
-                    type="button"
-                    onClick={() => void handleExploreDemo(ponytail)}
-                    className="inline-flex items-center gap-2 rounded-md border border-[#232832] bg-[#161A21] px-4 py-2.5 text-sm font-medium text-[#E6E9EF] hover:border-sky-500/50 cursor-pointer whitespace-nowrap"
-                  >
-                    <RefreshCw className="h-4 w-4" />
-                    <span>Retry analysis</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (ponytail) {
-                        void handleExploreDemo(ponytail);
-                      } else {
-                        navigate('/workspace/dietrichgebert__ponytail');
-                      }
-                    }}
-                    className="inline-flex items-center gap-2 rounded-md bg-sky-500 px-4 py-2.5 text-sm font-semibold text-[#0B0D10] hover:bg-sky-400 transition-colors cursor-pointer whitespace-nowrap"
-                  >
-                    <span>Explore repository</span>
-                    <ArrowRight className="h-4 w-4" />
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* Recently Imported Repositories */}
-          {otherRepos.length > 0 && (
-            <div className="pt-2 space-y-2">
-              <div className="text-xs font-medium text-[#9CA3AF]">Your imported repositories</div>
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                {otherRepos.map((repo) => (
-                  <div
-                    key={repo.id}
-                    className="flex items-center justify-between gap-4 rounded-lg border border-[#232832] bg-[#111419] px-4 py-3"
-                  >
-                    <div className="min-w-0">
-                      <div className="font-mono text-xs font-semibold text-[#E6E9EF] truncate">
-                        {repo.fullName}
-                      </div>
-                      <div className="mt-0.5 text-[11px] text-[#9CA3AF] truncate">
-                        {repo.stage === 'ready'
-                          ? `${repo.overview?.languages[0]?.name ?? 'Analyzed'} · commit ${repo.commitSha.slice(0, 7)}`
-                          : repo.stageMessage}
-                      </div>
+        {/* Recently Imported Repositories */}
+        {otherRepos.length > 0 && (
+          <section className="pt-2 space-y-2">
+            <div className="text-xs font-medium text-[#9CA3AF]">Your imported repositories</div>
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              {otherRepos.map((repo) => (
+                <div
+                  key={repo.id}
+                  className="flex items-center justify-between gap-4 rounded-lg border border-[#232832] bg-[#111419] px-4 py-3"
+                >
+                  <div className="min-w-0">
+                    <div className="font-mono text-xs font-semibold text-[#E6E9EF] truncate">
+                      {repo.fullName}
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => navigate(`/workspace/${encodeURIComponent(repo.id)}`)}
-                      className="rounded border border-[#232832] bg-[#161A21] px-3 py-1.5 text-xs font-medium text-[#E6E9EF] hover:border-sky-500/50 cursor-pointer shrink-0"
-                    >
-                      Open
-                    </button>
+                    <div className="mt-0.5 text-[11px] text-[#9CA3AF] truncate">
+                      {repo.stage === 'ready'
+                        ? `${repo.overview?.languages[0]?.name ?? 'Analyzed'} · commit ${repo.commitSha.slice(0, 7)}`
+                        : repo.stageMessage}
+                    </div>
                   </div>
-                ))}
-              </div>
+                  <button
+                    type="button"
+                    onClick={() => navigate(`/workspace/${encodeURIComponent(repo.id)}`)}
+                    className="rounded border border-[#232832] bg-[#161A21] px-3 py-1.5 text-xs font-medium text-[#E6E9EF] hover:border-sky-500/50 cursor-pointer shrink-0"
+                  >
+                    Open
+                  </button>
+                </div>
+              ))}
             </div>
-          )}
-        </section>
-
-        {/* How Codebase Tutor Works */}
-        <section className="grid grid-cols-1 gap-6 border-t border-[#232832] pt-12 md:grid-cols-4">
-          <div className="space-y-2">
-            <GitBranch className="h-4 w-4 text-sky-400" />
-            <h3 className="text-sm font-semibold text-[#F3F4F6]">Unified Knowledge Graph</h3>
-            <p className="text-xs leading-relaxed text-[#9CA3AF]">
-              AST and config parsers extract files, functions, classes, imports, and call edges into one canonical graph.
-            </p>
-          </div>
-          <div className="space-y-2">
-            <Layers className="h-4 w-4 text-sky-400" />
-            <h3 className="text-sm font-semibold text-[#F3F4F6]">Six Synchronized Views</h3>
-            <p className="text-xs leading-relaxed text-[#9CA3AF]">
-              Explore System Architecture, Data Flow, Sequence Diagrams, CI/CD, Deployment, and Class Diagrams from the same model.
-            </p>
-          </div>
-          <div className="space-y-2">
-            <Code2 className="h-4 w-4 text-sky-400" />
-            <h3 className="text-sm font-semibold text-[#F3F4F6]">Read-Only Source Evidence</h3>
-            <p className="text-xs leading-relaxed text-[#9CA3AF]">
-              Every diagram node, dependency edge, and explanation jumps directly to verified line numbers in the code viewer.
-            </p>
-          </div>
-          <div className="space-y-2">
-            <MessageSquare className="h-4 w-4 text-sky-400" />
-            <h3 className="text-sm font-semibold text-[#F3F4F6]">Context-Aware Tutor Chat</h3>
-            <p className="text-xs leading-relaxed text-[#9CA3AF]">
-              Drag code blocks into chat or click a function to ask targeted questions backed by hybrid graph + source retrieval.
-            </p>
-          </div>
-        </section>
+          </section>
+        )}
       </main>
+      )}
     </div>
   );
 }

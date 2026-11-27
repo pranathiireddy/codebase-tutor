@@ -38,7 +38,7 @@ export async function startServer(): Promise<void> {
   }
 
   app.listen(config.port, '0.0.0.0', () => {
-    console.log(`Codebase Tutor listening on http://localhost:${config.port}`);
+    console.log(`Plupus listening on http://localhost:${config.port}`);
   });
 }
 

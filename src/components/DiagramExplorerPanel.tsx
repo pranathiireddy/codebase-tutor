@@ -41,6 +41,7 @@ import { MermaidDiagram } from './MermaidDiagram';
 interface DiagramExplorerPanelProps {
   repositoryId: string;
   filesMeta: AnalyzedFileMeta[];
+  showMinimap: boolean;
   activeDiagramType: DiagramType;
   onChangeDiagramType: (type: DiagramType) => void;
   selectedGraphNodeId: string | null;
@@ -86,13 +87,13 @@ function ArchitectureNode({ data }: NodeProps<Node<CustomNodeData>>) {
       title={visual.description}
       className={`min-w-[200px] max-w-[240px] rounded-lg border px-3 py-2.5 transition-all ${
         isSelected
-          ? 'border-sky-400 bg-[#142030] shadow-[0_0_0_1px_rgba(56,189,248,0.4)]'
+          ? 'border-sky-400 bg-[#E7F4FA] shadow-[0_0_0_1px_rgba(83,163,199,0.3)]'
           : isPathHighlighted
             ? 'border-sky-500/70 bg-[#131B26]'
             : 'border-[#262C38] bg-[#141820] hover:border-[#3A4354]'
       } ${isDimmed ? 'opacity-35' : 'opacity-100'}`}
     >
-      <Handle type="target" position={Position.Top} className="!h-2 !w-2 !border-[#232832] !bg-sky-400" />
+      <Handle type="target" position={Position.Top} className="!h-2 !w-2 !border-[#B8D3E0] !bg-[#A9D7EA]" />
       <div className="flex items-center justify-between gap-2 mb-1">
         <span className={`text-[10px] font-medium uppercase tracking-wider ${categoryColor}`}>
           {visual.category}
@@ -105,7 +106,7 @@ function ArchitectureNode({ data }: NodeProps<Node<CustomNodeData>>) {
       {visual.sublabel && (
         <div className="mt-0.5 truncate text-[11px] text-[#9CA3AF]">{visual.sublabel}</div>
       )}
-      <Handle type="source" position={Position.Bottom} className="!h-2 !w-2 !border-[#232832] !bg-sky-400" />
+      <Handle type="source" position={Position.Bottom} className="!h-2 !w-2 !border-[#B8D3E0] !bg-[#A9D7EA]" />
     </div>
   );
 }
@@ -182,12 +183,12 @@ function createGraphSvg(diagram: DiagramPayload) {
     svg.setAttribute('width', String(width));
     svg.setAttribute('height', String(height));
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-    addSvgElement(svg, 'rect', { width: String(width), height: String(height), fill: '#0F1217' });
+    addSvgElement(svg, 'rect', { width: String(width), height: String(height), fill: '#E5F1F7' });
     addSvgElement(svg, 'text', {
       x: String(width / 2),
       y: '104',
-      fill: '#E6E9EF',
-      'font-family': 'Arial, sans-serif',
+      fill: '#172D3A',
+      'font-family': 'Onest, sans-serif',
       'font-size': '20',
       'font-weight': '600',
       'text-anchor': 'middle',
@@ -210,8 +211,8 @@ function createGraphSvg(diagram: DiagramPayload) {
       addSvgElement(svg, 'text', {
         x: String(width / 2),
         y: String(145 + index * 24),
-        fill: '#9CA3AF',
-        'font-family': 'Arial, sans-serif',
+        fill: '#526D7C',
+        'font-family': 'Onest, sans-serif',
         'font-size': '14',
         'text-anchor': 'middle',
       }, text);
@@ -235,10 +236,10 @@ function createGraphSvg(diagram: DiagramPayload) {
   svg.setAttribute('height', String(height));
   svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
-  addSvgElement(svg, 'rect', { width: String(width), height: String(height), fill: '#0F1217' });
+  addSvgElement(svg, 'rect', { width: String(width), height: String(height), fill: '#E5F1F7' });
 
   const defs = addSvgElement(svg, 'defs', {});
-  const edgeColors = { verified: '#64748B', inferred: '#D97706', uncertain: '#9CA3AF' };
+  const edgeColors = { verified: '#7898A8', inferred: '#C08A2E', uncertain: '#A0B2BC' };
   Object.entries(edgeColors).forEach(([confidence, color]) => {
     const marker = addSvgElement(defs, 'marker', {
       id: `arrow-${confidence}`,
@@ -280,7 +281,7 @@ function createGraphSvg(diagram: DiagramPayload) {
     const position = offsetNode(node);
     const categoryColor =
       node.category === 'file'
-        ? '#38BDF8'
+        ? '#429DC7'
         : node.category === 'module'
           ? '#A5B4FC'
           : node.category === 'api'
@@ -297,27 +298,27 @@ function createGraphSvg(diagram: DiagramPayload) {
       width: String(nodeWidth),
       height: String(nodeHeight),
       rx: '8',
-      fill: '#141820',
-      stroke: '#262C38',
+      fill: '#E4F1F7',
+      stroke: '#B8D3E0',
       'stroke-width': '1.5',
     });
     addSvgElement(group, 'circle', {
       cx: String(position.x + nodeWidth / 2),
       cy: String(position.y),
       r: '4',
-      fill: '#60A5FA',
+      fill: '#559DBE',
     });
     addSvgElement(group, 'circle', {
       cx: String(position.x + nodeWidth / 2),
       cy: String(position.y + nodeHeight),
       r: '4',
-      fill: '#60A5FA',
+      fill: '#559DBE',
     });
     addSvgElement(group, 'text', {
       x: String(position.x + 12),
       y: String(position.y + 20),
       fill: categoryColor,
-      'font-family': 'Arial, sans-serif',
+      'font-family': 'Onest, sans-serif',
       'font-size': '10',
       'font-weight': '600',
     }, node.category.toUpperCase());
@@ -326,7 +327,7 @@ function createGraphSvg(diagram: DiagramPayload) {
         x: String(position.x + nodeWidth - 12),
         y: String(position.y + 20),
         fill: '#FBBF24',
-        'font-family': 'Arial, sans-serif',
+        'font-family': 'Onest, sans-serif',
         'font-size': '10',
         'text-anchor': 'end',
       }, node.confidence);
@@ -334,8 +335,8 @@ function createGraphSvg(diagram: DiagramPayload) {
     addSvgElement(group, 'text', {
       x: String(position.x + 12),
       y: String(position.y + 44),
-      fill: '#F3F4F6',
-      'font-family': 'Arial, sans-serif',
+      fill: '#172D3A',
+      'font-family': 'Onest, sans-serif',
       'font-size': '13',
       'font-weight': '600',
     }, node.label.length > 28 ? `${node.label.slice(0, 25)}...` : node.label);
@@ -343,8 +344,8 @@ function createGraphSvg(diagram: DiagramPayload) {
       addSvgElement(group, 'text', {
         x: String(position.x + 12),
         y: String(position.y + 64),
-        fill: '#9CA3AF',
-        'font-family': 'Arial, sans-serif',
+        fill: '#526D7C',
+        'font-family': 'Onest, sans-serif',
         'font-size': '11',
       }, node.sublabel.length > 30 ? `${node.sublabel.slice(0, 27)}...` : node.sublabel);
     }
@@ -378,6 +379,7 @@ function ConfidenceLabel({ level }: { level: 'verified' | 'inferred' | 'uncertai
 export function DiagramExplorerPanel({
   repositoryId,
   filesMeta,
+  showMinimap,
   activeDiagramType,
   onChangeDiagramType,
   selectedGraphNodeId,
@@ -444,7 +446,7 @@ export function DiagramExplorerPanel({
           if (!context) {
             throw new Error('Your browser could not create an image canvas.');
           }
-          context.fillStyle = '#0F1217';
+          context.fillStyle = '#E5F1F7';
           context.fillRect(0, 0, canvas.width, canvas.height);
           context.drawImage(image, 0, 0, canvas.width, canvas.height);
           canvas.toBlob((blob) => {
@@ -628,10 +630,10 @@ export function DiagramExplorerPanel({
         animated: Boolean(popUp),
         markerEnd: {
           type: MarkerType.ArrowClosed,
-          color: popUp ? '#38BDF8' : e.confidence === 'inferred' ? '#F59E0B' : '#64748B',
+          color: popUp ? '#429DC7' : e.confidence === 'inferred' ? '#F59E0B' : '#64748B',
         },
         style: {
-          stroke: popUp ? '#38BDF8' : e.confidence === 'inferred' ? '#D97706' : '#475569',
+          stroke: popUp ? '#429DC7' : e.confidence === 'inferred' ? '#D97706' : '#475569',
           strokeWidth: popUp ? 3 : 1.5,
           strokeDasharray: e.confidence === 'inferred' && !popUp ? '5 4' : undefined,
           opacity: inPath ? 1 : 0.15,
@@ -1038,9 +1040,9 @@ export function DiagramExplorerPanel({
               }}
               proOptions={{ hideAttribution: true }}
             >
-              <Background color="#1E2430" gap={20} size={1} />
+              <Background color="#C8DDE8" gap={20} size={1} />
               <Controls />
-              <MiniMap nodeColor="#1E293B" maskColor="rgba(11, 13, 16, 0.75)" />
+              {showMinimap && <MiniMap nodeColor="#B6D7E6" maskColor="rgba(244, 247, 249, 0.75)" />}
             </ReactFlow>
           )}
         </div>

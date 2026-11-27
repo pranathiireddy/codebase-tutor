@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
-  ArrowLeft,
   Code2,
   Compass,
   Home,
@@ -131,7 +130,6 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
   const [midWidth, setMidWidth] = useState(20);
   const [chatCollapsed, setChatCollapsed] = useState(false);
   const [filesCollapsed, setFilesCollapsed] = useState(false);
-  const hasCollapsedPanels = chatCollapsed || filesCollapsed;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const draggingDivider = useRef<'left' | 'mid' | null>(null);
 
@@ -147,12 +145,11 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
         const rect = containerRef.current.getBoundingClientRect();
         if (rect.width <= 0) return;
         const pct = ((clientX - rect.left) / rect.width) * 100;
-        const railWidthPct = hasCollapsedPanels ? (44 / rect.width) * 100 : 0;
         if (draggingDivider.current === 'left') {
-          setLeftWidth(Math.min(42, Math.max(18, pct - railWidthPct)));
+          setLeftWidth(Math.min(42, Math.max(18, pct)));
         } else {
           const chatWidthPct = chatCollapsed ? 0 : leftWidth;
-          const nextMid = pct - railWidthPct - chatWidthPct;
+          const nextMid = pct - chatWidthPct;
           setMidWidth(Math.min(34, Math.max(14, nextMid)));
         }
       });
@@ -171,7 +168,7 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
     };
-  }, [chatCollapsed, hasCollapsedPanels, leftWidth]);
+  }, [chatCollapsed, leftWidth]);
 
   // Load repository list
   const loadRepoList = useCallback(async () => {
@@ -1197,10 +1194,11 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
         <div className="flex items-center gap-3 min-w-0">
           <Link
             to="/"
-            className="flex items-center gap-1.5 text-xs font-medium text-[#9CA3AF] hover:text-[#F3F4F6] whitespace-nowrap shrink-0"
+            aria-label="Plupus home"
+            className="flex items-center gap-2 whitespace-nowrap shrink-0 hover:text-sky-400 transition-colors"
           >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            <span>Codebase Tutor</span>
+            <img src="/brand/plupus-logo.png" alt="" className="brand-octopus h-7 w-7" />
+            <span className="brand-wordmark text-xl leading-none">PLUPUS</span>
           </Link>
           <span className="text-[#323947]">/</span>
 
@@ -1336,53 +1334,55 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
           </div>
         </div>
       ) : (
-        <div ref={containerRef} className="flex flex-1 min-h-0 overflow-hidden select-text">
-          {hasCollapsedPanels && (
-            <div className="flex h-full w-11 shrink-0 flex-col items-center gap-1 border-r border-[#232832] bg-[#111419] py-2">
-              {chatCollapsed && (
-                <button
-                  type="button"
-                  onClick={() => setChatCollapsed(false)}
-                  title="Expand Tutor Chat"
-                  aria-label="Expand Tutor Chat"
-                  aria-expanded={false}
-                  className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300 cursor-pointer"
-                >
-                  <MessageSquare className="h-4 w-4" />
-                </button>
-              )}
-              {filesCollapsed && (
-                <button
-                  type="button"
-                  onClick={() => setFilesCollapsed(false)}
-                  title="Expand File Explorer"
-                  aria-label="Expand File Explorer"
-                  aria-expanded={false}
-                  className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300 cursor-pointer"
-                >
-                  <Files className="h-4 w-4" />
-                </button>
-              )}
-              <div className="mt-auto flex flex-col gap-1">
-                <Link
-                  to="/"
-                  title="Home"
-                  aria-label="Home"
-                  className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
-                >
-                  <Home className="h-4 w-4" />
-                </Link>
-                {!readOnly && <Link
-                  to="/settings"
-                  title="Settings"
-                  aria-label="Settings"
-                  className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
-                >
-                  <Settings className="h-4 w-4" />
-                </Link>}
-              </div>
-            </div>
-          )}
+        <div className="flex flex-1 min-h-0 overflow-hidden select-text">
+          <nav aria-label="Workspace navigation" className="flex h-full w-11 shrink-0 flex-col items-center gap-1 border-r border-[#232832] bg-[#111419] py-2">
+            <Link
+              to="/"
+              title="Home"
+              aria-label="Home"
+              className="rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
+            >
+              <Home className="h-4 w-4" />
+            </Link>
+            <button
+              type="button"
+              onClick={() => setFilesCollapsed((collapsed) => !collapsed)}
+              title={filesCollapsed ? 'Show File Explorer' : 'Hide File Explorer'}
+              aria-label="File Explorer"
+              aria-pressed={!filesCollapsed}
+              className={`rounded-md p-2 transition-colors ${
+                filesCollapsed
+                  ? 'text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300'
+                  : 'bg-sky-500/15 text-sky-300'
+              }`}
+            >
+              <Files className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setChatCollapsed((collapsed) => !collapsed)}
+              title={chatCollapsed ? 'Show Plupus Chat' : 'Hide Plupus Chat'}
+              aria-label="Plupus Chat"
+              aria-pressed={!chatCollapsed}
+              className={`rounded-md p-2 transition-colors ${
+                chatCollapsed
+                  ? 'text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300'
+                  : 'bg-sky-500/15 text-sky-300'
+              }`}
+            >
+              <MessageSquare className="h-4 w-4" />
+            </button>
+            <Link
+              to="/settings"
+              title="Settings"
+              aria-label="Settings"
+              className="mt-auto rounded-md p-2 text-[#9CA3AF] hover:bg-[#1A1F28] hover:text-sky-300"
+            >
+              <Settings className="h-4 w-4" />
+            </Link>
+          </nav>
+
+          <div ref={containerRef} className="flex min-w-0 flex-1 overflow-hidden">
 
           {/* Panel A: Chat */}
           {!chatCollapsed && (
@@ -1484,6 +1484,7 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
               <DiagramExplorerPanel
                 repositoryId={repository.id}
                 filesMeta={filesMeta}
+                showMinimap={preferences.showMinimap}
                 activeDiagramType={activeDiagramType}
                 onChangeDiagramType={(type) => {
                   setActiveDiagramType(type);
@@ -1535,6 +1536,7 @@ export function WorkspacePage({ readOnly = false }: { readOnly?: boolean }) {
                 onCompleteStep={(stepIndex) => void markTourStepComplete(stepIndex)}
               />
             )}
+          </div>
           </div>
         </div>
       )}

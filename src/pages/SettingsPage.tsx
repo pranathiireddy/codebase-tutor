@@ -614,7 +614,7 @@ export function SettingsPage() {
                   className="mt-0.5 accent-sky-500"
                 />
                 <span>
-                  I authorize Codebase Tutor to access private repository contents with read-only permission. I understand the code is processed in memory only.
+                  I authorize Plupus to access private repository contents with read-only permission. I understand the code is processed in memory only.
                 </span>
               </label>
               <button
@@ -951,8 +951,8 @@ export function SettingsPage() {
 
           <div className="flex items-center justify-between gap-4 border-t border-[#232832] pt-5">
             <div>
-              <div className="text-xs font-semibold text-[#F3F4F6]">Show Code Minimap</div>
-              <p className="text-[11px] text-[#9CA3AF]">Display overview minimap inside the Monaco source viewer.</p>
+              <div className="text-xs font-semibold text-[#F3F4F6]">Show Workspace Minimap</div>
+              <p className="text-[11px] text-[#9CA3AF]">Display minimaps in both the diagram canvas and source code viewer.</p>
             </div>
             <button
               type="button"

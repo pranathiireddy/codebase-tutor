@@ -688,7 +688,7 @@ export function ChatPanel({
             >
               <div className="flex items-center justify-between gap-2 text-[11px]">
                 <span className="font-semibold text-[#9CA3AF]">
-                  {msg.role === 'user' ? 'You' : 'Codebase Tutor'}
+                  {msg.role === 'user' ? 'You' : 'Plupus'}
                 </span>
                 {msg.role === 'assistant' && (
                   <div className="flex items-center gap-2 shrink-0">

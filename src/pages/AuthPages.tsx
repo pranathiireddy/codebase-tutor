@@ -98,7 +98,7 @@ export function LoginPage() {
       <main className="mx-auto max-w-md px-6 py-16">
         <div className="rounded-xl border border-[#232832] bg-[#111419] p-6 space-y-5">
           <div>
-            <h1 className="text-lg font-semibold text-[#F9FAFB]">Sign in to Codebase Tutor</h1>
+            <h1 className="text-lg font-semibold text-[#F9FAFB]">Sign in to Plupus</h1>
             <p className="mt-1 text-xs text-[#9CA3AF]">
               Access your workspace preferences and imported repositories.
             </p>
@@ -159,7 +159,7 @@ export function LoginPage() {
           <GitHubSignInOption redirectAfter="/login" />
 
           <p className="text-center text-xs text-[#9CA3AF]">
-            New to Codebase Tutor?{' '}
+            New to Plupus?{' '}
             <Link to="/signup" className="text-sky-400 hover:text-sky-300">
               Create an account
             </Link>
@@ -210,7 +210,7 @@ export function SignupPage() {
       <main className="mx-auto max-w-md px-6 py-16">
         <div className="rounded-xl border border-[#232832] bg-[#111419] p-6 space-y-5">
           <div>
-            <h1 className="text-lg font-semibold text-[#F9FAFB]">Create a Codebase Tutor account</h1>
+            <h1 className="text-lg font-semibold text-[#F9FAFB]">Create a Plupus account</h1>
             <p className="mt-1 text-xs text-[#9CA3AF]">
               Save your learning workspace preferences.
             </p>
